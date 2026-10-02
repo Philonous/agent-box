@@ -29,6 +29,7 @@ share_claude=0
 nix_daemon=1
 nix_ok=0
 dry_run=0
+new_session=0
 extra_binds=()
 extra_env=()
 cmd=()
@@ -38,7 +39,9 @@ usage() {
 Usage: claude-box [options] [--] [command [args...]]
 
 Runs a command confined to the project directory. The command defaults to
-`claude`; give another one to inspect or test the sandbox from inside.
+`claude --continue`, resuming the project's last conversation (plain
+`claude` if there is none yet); give another one to inspect or test the
+sandbox from inside.
 
 Options:
   -d, --dir PATH      Project root to confine to (default: current directory)
@@ -49,13 +52,15 @@ Options:
       --bind PATH     Additionally bind PATH read-write (repeatable)
       --ro-bind PATH  Additionally bind PATH read-only (repeatable)
       --env VAR       Pass environment variable VAR through (repeatable)
+      --new           Start a fresh conversation instead of --continue
       --dry-run       Print the bwrap command that would run, then exit
   -h, --help          Show this help
 
 Use -- to separate the command from claude-box's own options.
 
 Examples:
-  claude-box                                   # confine to $PWD, run claude
+  claude-box                                   # confine to $PWD, resume claude
+  claude-box --new                             # ...or start a new conversation
   claude-box --ro-bind ~/.gitconfig            # let git commit work
   claude-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
   claude-box bash                              # poke around inside the sandbox
@@ -78,6 +83,7 @@ while [[ $# -gt 0 ]]; do
                        extra_binds+=(--ro-bind "$(realpath -- "$2")" "$(realpath -- "$2")"); shift 2 ;;
         --env)         [[ $# -ge 2 ]] || die "--env needs an argument"
                        extra_env+=("$2"); shift 2 ;;
+        --new)         new_session=1; shift ;;
         --dry-run)     dry_run=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         --)            shift; cmd=("$@"); break ;;
@@ -93,7 +99,14 @@ if [[ ${#cmd[@]} -gt 0 && ${cmd[0]} == -* ]]; then
              did you mean: claude-box -- claude ${cmd[*]}"
 fi
 
-[[ ${#cmd[@]} -gt 0 ]] || cmd=(claude)
+# Only the default command gets --continue; an explicit one runs verbatim.
+default_cmd=0
+if [[ ${#cmd[@]} -eq 0 ]]; then
+    cmd=(claude)
+    default_cmd=1
+elif [[ $new_session -eq 1 ]]; then
+    die "--new only applies to the default command, not '${cmd[0]}'"
+fi
 
 # ---------------------------------------------------------------- preflight --
 
@@ -223,6 +236,22 @@ PY
     if [[ -f "$HOME/.claude/.credentials.json" ]]; then
         state_args+=(--bind "$HOME/.claude/.credentials.json" \
                             "$HOME/.claude/.credentials.json")
+    fi
+fi
+
+# Resume the last conversation by default. `claude --continue` exits with an
+# error when there is nothing to resume, so only add it once this project has a
+# transcript. Claude keys transcripts by the project path with every
+# non-alphanumeric character replaced by '-'.
+if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
+    if [[ $share_claude -eq 1 ]]; then
+        claude_dir="$HOME/.claude"
+    else
+        claude_dir="$state_root/claude"
+    fi
+    transcripts="$claude_dir/projects/${project//[^a-zA-Z0-9]/-}"
+    if compgen -G "$transcripts/*.jsonl" >/dev/null; then
+        cmd+=(--continue)
     fi
 fi
 

@@ -19,13 +19,19 @@ nix run github:you/claude-box                 # no install needed, see below
 ```
 
 ```sh
-./claude-box                                  # confine to $PWD, run claude
+./claude-box                                  # confine to $PWD, resume claude
+./claude-box --new                            # start a fresh conversation
 ./claude-box -d ~/src/foo                     # confine to another directory
 ./claude-box -- claude -p 'run the tests'     # pass args through to claude
 ./claude-box --dry-run                        # print the bwrap command, don't run
 ```
 
-The command defaults to `claude`, but any command works, which is the easiest
+The command defaults to `claude --continue`, resuming the project's last
+conversation; `--new` starts a fresh one instead. On a project with no
+conversation yet, plain `claude` is run, since `--continue` would fail there.
+An explicitly given command (`claude-box -- claude ...`) is always run verbatim.
+
+Any other command works too, which is the easiest
 way to see what the sandbox actually looks like from inside:
 
 ```sh
@@ -51,6 +57,7 @@ older `claude-box -- -p '...'` form now tells you to write
 | `--bind PATH` | Additionally bind `PATH` read-write (repeatable) |
 | `--ro-bind PATH` | Additionally bind `PATH` read-only (repeatable) |
 | `--env VAR` | Pass one more environment variable through the scrub (repeatable) |
+| `--new` | Start a fresh conversation instead of passing `--continue` to the default `claude` |
 | `--dry-run` | Print the fully-expanded `bwrap` command and exit |
 
 Everything after `--` is the command line to run, verbatim.
