@@ -1,13 +1,48 @@
 {
-  description = "claude-box — run Claude Code confined to the current project directory";
+  description = "claude-box — run a command confined to the current project directory";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = f:
-        nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      # claude-code carries an unfree licence, so legacyPackages refuses to
+      # evaluate it. Allow that one package by name — a blanket allowUnfree
+      # would silently cover anything else added to the toolchain later.
+      pkgsFor = system: import nixpkgs {
+        inherit system;
+        config.allowUnfreePredicate = pkg:
+          nixpkgs.lib.getName pkg == "claude-code";
+      };
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
+
+      # The toolchain the sandbox gets. claude-box builds the sandbox's PATH by
+      # stripping the $HOME entries off the host's, so anything installed under
+      # $HOME (npm globals, ~/.local/bin) is *not* there — these store paths are
+      # what makes `nix run .` work on a machine with nothing installed.
+      #
+      # Appended as a suffix, so a tool the user already has still wins.
+      toolchain = pkgs: with pkgs; [
+        claude-code
+
+        # shell and the POSIX basics the script and any agent lean on
+        bashInteractive coreutils findutils gnugrep gnused gawk
+        diffutils patch less which procps
+
+        # version control and search
+        git gh ripgrep fd jq tree
+
+        # the client half of the Nix daemon passthrough (see --no-nix)
+        nix
+
+        # runtimes: python3 also does claude-box's first-run config seeding
+        python3 nodejs
+
+        # network and archives (cacert is not listed: it ships no bin/, it is
+        # referenced directly for SSL_CERT_FILE below)
+        curl gnutar gzip xz unzip
+      ];
     in
     {
       packages = forAllSystems (pkgs: rec {
@@ -19,13 +54,17 @@
           installPhase = ''
             runHook preInstall
             install -Dm755 claude-box $out/bin/claude-box
-            # bwrap must be on PATH; python3 is only used for first-run seeding.
+            patchShebangs $out/bin/claude-box
+            # bwrap is pinned ahead of the host's: the sandbox depends on its
+            # exact flag behaviour. Everything else is a fallback.
             wrapProgram $out/bin/claude-box \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap pkgs.python3Minimal ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
+              --suffix PATH : ${pkgs.lib.makeBinPath (toolchain pkgs)} \
+              --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             runHook postInstall
           '';
           meta = with pkgs.lib; {
-            description = "Run Claude Code confined to the current project directory";
+            description = "Run a command confined to the current project directory";
             platforms = platforms.linux;
             mainProgram = "claude-box";
           };

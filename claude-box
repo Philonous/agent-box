@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 #
-# claude-box — run Claude Code confined to the current project directory.
+# claude-box — run a command (Claude Code by default) confined to the current
+# project directory.
 #
 # Uses bubblewrap (user namespaces) to give Claude Code a private mount, PID,
 # IPC, UTS and cgroup namespace. The project directory is the only writable
 # path outside the sandbox's own tmpfs; $HOME is replaced by a tmpfs so other
 # projects, SSH keys and shell history are simply not there.
 #
+# The command defaults to `claude`, but any command can be given instead, which
+# is the easy way to inspect what the sandbox actually looks like from inside.
+#
 # Nix-aware: resolves the Nix profile chain to its store path and recreates it
 # as a symlink inside the sandbox, so the toolchain on $PATH keeps working
-# without binding anything under the real $HOME.
+# without binding anything under the real $HOME. The Nix daemon socket is passed
+# through as well, so builds work inside; see --no-nix.
 
 set -euo pipefail
 
@@ -21,21 +26,25 @@ project="$PWD"
 project_mode="--bind"
 offline=0
 share_claude=0
+nix_daemon=1
+nix_ok=0
 dry_run=0
 extra_binds=()
 extra_env=()
-claude_args=()
+cmd=()
 
 usage() {
     cat <<'USAGE'
-Usage: claude-box [options] [-- claude-args...]
+Usage: claude-box [options] [--] [command [args...]]
 
-Runs Claude Code confined to the project directory.
+Runs a command confined to the project directory. The command defaults to
+`claude`; give another one to inspect or test the sandbox from inside.
 
 Options:
   -d, --dir PATH      Project root to confine to (default: current directory)
       --ro            Bind the project read-only instead of read-write
       --offline       Cut off network access (breaks the API; for auditing code)
+      --no-nix        Do not pass the Nix daemon socket through
       --share-claude  Bind the real ~/.claude and ~/.claude.json read-write
       --bind PATH     Additionally bind PATH read-write (repeatable)
       --ro-bind PATH  Additionally bind PATH read-only (repeatable)
@@ -43,12 +52,15 @@ Options:
       --dry-run       Print the bwrap command that would run, then exit
   -h, --help          Show this help
 
-Everything after -- is passed to claude verbatim.
+Use -- to separate the command from claude-box's own options.
 
 Examples:
-  claude-box                                  # confine to $PWD, interactive
-  claude-box --ro-bind ~/.gitconfig           # let git commit work
-  claude-box -d ~/src/foo -- -p 'run tests'   # one-shot prompt
+  claude-box                                   # confine to $PWD, run claude
+  claude-box --ro-bind ~/.gitconfig            # let git commit work
+  claude-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
+  claude-box bash                              # poke around inside the sandbox
+  claude-box -- env                            # see the scrubbed environment
+  claude-box --offline -- ls -la /             # what the filesystem looks like
 USAGE
 }
 
@@ -58,6 +70,7 @@ while [[ $# -gt 0 ]]; do
                        project="$2"; shift 2 ;;
         --ro)          project_mode="--ro-bind"; shift ;;
         --offline)     offline=1; shift ;;
+        --no-nix)      nix_daemon=0; shift ;;
         --share-claude) share_claude=1; shift ;;
         --bind)        [[ $# -ge 2 ]] || die "--bind needs an argument"
                        extra_binds+=(--bind "$(realpath -- "$2")" "$(realpath -- "$2")"); shift 2 ;;
@@ -67,10 +80,20 @@ while [[ $# -gt 0 ]]; do
                        extra_env+=("$2"); shift 2 ;;
         --dry-run)     dry_run=1; shift ;;
         -h|--help)     usage; exit 0 ;;
-        --)            shift; claude_args=("$@"); break ;;
-        *)             die "unknown option: $1 (use -- to pass args to claude)" ;;
+        --)            shift; cmd=("$@"); break ;;
+        -*)            die "unknown option: $1 (use -- to separate the command)" ;;
+        *)             cmd=("$@"); break ;;
     esac
 done
+
+# Everything after -- used to be claude's arguments; it is now the command
+# itself. Catch the old form rather than failing with a bare execvp error.
+if [[ ${#cmd[@]} -gt 0 && ${cmd[0]} == -* ]]; then
+    die "'${cmd[0]}' is the command to run, not an argument to claude.
+             did you mean: claude-box -- claude ${cmd[*]}"
+fi
+
+[[ ${#cmd[@]} -gt 0 ]] || cmd=(claude)
 
 # ---------------------------------------------------------------- preflight --
 
@@ -94,6 +117,22 @@ nix_args=()
 [[ -d /nix/store ]] || die "/nix/store not found — is this a Nix system?"
 nix_args+=(--ro-bind /nix/store /nix/store)
 
+# Builds are done by the daemon, which runs as root outside the sandbox, so
+# passing them through is a matter of reaching its socket — the store itself
+# stays read-only and every write to it remains the daemon's to make. /nix/var
+# is bound read-only for the client's sake: NIX_PATH channels live under
+# /nix/var/nix/profiles, and the daemon socket is re-bound read-write on top.
+#
+# --offline turns this off. The daemon fetches on the sandbox's behalf, so
+# leaving it connected would make that flag a lie.
+[[ $offline -eq 1 ]] && nix_daemon=0
+
+if [[ $nix_daemon -eq 1 && -S /nix/var/nix/daemon-socket/socket ]]; then
+    nix_ok=1
+    nix_args+=(--ro-bind /nix/var /nix/var)
+    nix_args+=(--bind /nix/var/nix/daemon-socket /nix/var/nix/daemon-socket)
+fi
+
 # NixOS runtime paths. Use -try so this also works on plain-Nix hosts.
 for p in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32; do
     [[ -e "$p" ]] && nix_args+=(--ro-bind-try "$p" "$p")
@@ -111,6 +150,9 @@ for link in \
     /nix/var/nix/profiles/default
 do
     [[ -e "$link" ]] || continue
+    # Already present via the read-only /nix/var bind; --symlink over it would
+    # abort with EEXIST.
+    [[ $nix_ok -eq 1 && "$link" == /nix/var/* ]] && continue
     target="$(readlink -f -- "$link" 2>/dev/null)" || continue
     case "$target" in
         /nix/store/*) profile_args+=(--symlink "$target" "$link") ;;
@@ -198,6 +240,14 @@ while IFS= read -r entry; do
     sandbox_path="${sandbox_path:+$sandbox_path:}$entry"
 done < <(printf '%s' "$PATH" | tr ':' '\n')
 
+# The sandbox PATH is the host's minus the $HOME entries, so a command can be
+# resolvable out here and missing in there. Say so plainly instead of letting
+# bwrap fail with a bare execvp error.
+if [[ ${cmd[0]} != */* ]]; then
+    ( PATH="$sandbox_path"; hash -r; command -v -- "${cmd[0]}" ) >/dev/null 2>&1 \
+        || die "command not found on the sandbox PATH: ${cmd[0]}"
+fi
+
 env_args=(--clearenv)
 env_args+=(--setenv HOME "$HOME")
 env_args+=(--setenv USER "${USER:-$(id -un)}")
@@ -205,15 +255,41 @@ env_args+=(--setenv LOGNAME "${LOGNAME:-${USER:-$(id -un)}}")
 env_args+=(--setenv PATH "$sandbox_path")
 env_args+=(--setenv PWD "$project")
 
+# NIX_PATH is what makes <nixpkgs> resolve; it points into /nix/var/nix/profiles,
+# which is bound above. Only pass them when the daemon actually came through.
+nix_env=()
+[[ $nix_ok -eq 1 ]] && nix_env=(NIX_REMOTE NIX_PATH)
+
 # Pass through only benign locale/terminal settings plus Anthropic config, so
 # unrelated secrets in the parent shell (AWS_*, GITHUB_TOKEN, ...) stay out.
 for var in SHELL TERM COLORTERM TERM_PROGRAM LANG LC_ALL LC_CTYPE TZ \
+           SSL_CERT_FILE NIX_SSL_CERT_FILE "${nix_env[@]}" \
            ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
            ANTHROPIC_MODEL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
            "${extra_env[@]}"
 do
     [[ -n "${!var:-}" ]] && env_args+=(--setenv "$var" "${!var}")
 done
+
+# ~/.config/nix/nix.conf is deliberately not bound: it routinely carries
+# access-tokens. Its other settings still matter — experimental-features being
+# the one that decides whether `nix build` runs at all — so the file is passed
+# through as NIX_CONFIG with the secret-bearing settings filtered out.
+if [[ $nix_ok -eq 1 ]]; then
+    nix_config="${NIX_CONFIG:-}"
+    if [[ -f "$HOME/.config/nix/nix.conf" ]]; then
+        scrubbed="$(grep -Ev \
+            '^[[:space:]]*(extra-)?(access-tokens|netrc-file|secret-key-files)[[:space:]]*=' \
+            "$HOME/.config/nix/nix.conf" || true)"
+        if [[ -n "$nix_config" ]]; then
+            nix_config="$(printf '%s\n%s' "$nix_config" "$scrubbed")"
+        else
+            nix_config="$scrubbed"
+        fi
+    fi
+    [[ -n "${nix_config//[[:space:]]/}" ]] \
+        && env_args+=(--setenv NIX_CONFIG "$nix_config")
+fi
 
 # ----------------------------------------------------------- sandbox launch --
 
@@ -248,9 +324,9 @@ bwrap_args=(
 
 if [[ $dry_run -eq 1 ]]; then
     printf 'bwrap'
-    printf ' %q' "${bwrap_args[@]}" -- claude "${claude_args[@]}"
+    printf ' %q' "${bwrap_args[@]}" -- "${cmd[@]}"
     printf '\n'
     exit 0
 fi
 
-exec bwrap "${bwrap_args[@]}" -- claude "${claude_args[@]}"
+exec bwrap "${bwrap_args[@]}" -- "${cmd[@]}"
