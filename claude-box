@@ -250,7 +250,11 @@ if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
         claude_dir="$state_root/claude"
     fi
     transcripts="$claude_dir/projects/${project//[^a-zA-Z0-9]/-}"
-    if compgen -G "$transcripts/*.jsonl" >/dev/null; then
+    # Not compgen: the minimal bash a Nix shebang resolves to is built
+    # without programmable completion. With nullglob off an unmatched glob
+    # stays literal, and -e on that literal is false.
+    transcript_files=("$transcripts"/*.jsonl)
+    if [[ -e ${transcript_files[0]} ]]; then
         cmd+=(--continue)
     fi
 fi

@@ -17,3 +17,6 @@
 * Can't test the daemon from the agent sandbox; simulate with
   `bwrap --dev-bind / / --bind <fake> /nix/var`. That leaves an empty /nix/var
   mountpoint behind, so `test -d /nix/var` afterwards lies — `rmdir` it.
+* The nixpkgs non-interactive `bash` (what `patchShebangs` resolves
+  `env bash` to) is built without programmable completion, so `compgen` is
+  "command not found" in the installed script though it works on the host.
