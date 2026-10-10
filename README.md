@@ -1,3 +1,5 @@
+**NB**: 🤖This project is in large parts generated via LLM🤖
+
 # agent-box
 
 Run Claude Code, or any command, confined to one project directory with
