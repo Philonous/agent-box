@@ -5,8 +5,8 @@
 
 [CLAUDE NOTES]
 * The agent's own Bash sandbox has a minimal PATH: no coreutils, bash, or nix,
-  and no `/usr/bin/env` (so `./claude-box` fails with "bad interpreter").
-  Fix: `export PATH=/run/current-system/sw/bin:$PATH`, and run `bash ./claude-box`.
+  and no `/usr/bin/env` (so `./agent-box` fails with "bad interpreter").
+  Fix: `export PATH=/run/current-system/sw/bin:$PATH`, and run `bash ./agent-box`.
 * That sandbox binds /nix/store but not /nix/var, so `nix eval` works while
   `nix build`/`nix run` fall back to a chroot store at ~/.local/share/nix/root
   (grows to ~500MB of fetched sources) — don't build from here.
@@ -27,13 +27,13 @@
   removing the path, not binding it ro.
 * The sudo switch can't be tested from the agent sandbox: bwrap sets
   NO_NEW_PRIVS, so setuid sudo refuses ("no new privileges flag is set").
-* claude-box-mount (idmapped mounts) needs real root: untestable from the agent
-  sandbox. Phase 2 can be simulated by hand-binding paths to $CLAUDE_BOX_STAGE/N.
+* agent-box-mount (idmapped mounts) needs real root: untestable from the agent
+  sandbox. Phase 2 can be simulated by hand-binding paths to $AGENT_BOX_STAGE/N.
 * The agent sandbox runs as `agents`, so `nix eval .` fails ("repository path
   ... is not owned by current user"); `nix eval "path:$PWD#..."` works but
   rewrote flake.lock with a newer nixpkgs — `git checkout flake.lock` after.
 * This repo is shared with the agent sandbox via ACLs; `chmod` on a file resets
-  its ACL mask and locks the agent out (happened to claude-box-mount). Fix:
+  its ACL mask and locks the agent out (happened to agent-box-mount). Fix:
   `setfacl -m m::rwx FILE`.
 * `X-mount.idmap=u:A:B:1` maps on-disk A to B as seen on the mount — reverse of
   the mount(8) wording. A map without a `g:` part fails with EINVAL.

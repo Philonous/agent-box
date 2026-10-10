@@ -1,5 +1,5 @@
 {
-  description = "claude-box — run a command confined to the current project directory";
+  description = "agent-box — run a command confined to the current project directory";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,7 +17,7 @@
       };
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
 
-      # The toolchain the sandbox gets. claude-box builds the sandbox's PATH by
+      # The toolchain the sandbox gets. agent-box builds the sandbox's PATH by
       # stripping the $HOME entries off the host's, so anything installed under
       # $HOME (npm globals, ~/.local/bin) is *not* there — these store paths are
       # what makes `nix run .` work on a machine with nothing installed.
@@ -39,7 +39,7 @@
         # the client half of the Nix daemon passthrough (see --no-nix)
         nix
 
-        # runtimes: python3 also does claude-box's first-run config seeding
+        # runtimes: python3 also does agent-box's first-run config seeding
         python3 nodejs
 
         # network and archives (cacert is not listed: it ships no bin/, it is
@@ -49,52 +49,52 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        claude-box = pkgs.stdenvNoCC.mkDerivation {
-          pname = "claude-box";
+        agent-box = pkgs.stdenvNoCC.mkDerivation {
+          pname = "agent-box";
           version = "0.1.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
             runHook preInstall
-            install -Dm755 claude-box $out/bin/claude-box
-            install -Dm755 claude-box-mount $out/bin/claude-box-mount
-            patchShebangs $out/bin/claude-box $out/bin/claude-box-mount
+            install -Dm755 agent-box $out/bin/agent-box
+            install -Dm755 agent-box-mount $out/bin/agent-box-mount
+            patchShebangs $out/bin/agent-box $out/bin/agent-box-mount
             # The helper runs as root, so its PATH is fixed to store paths rather
             # than whatever the host has. Not wrapped: the sudoers rule should
             # name the script itself, not a wrapper around it.
-            substituteInPlace $out/bin/claude-box-mount \
+            substituteInPlace $out/bin/agent-box-mount \
               --replace-fail 'PATH=/run/current-system/sw/bin:/usr/bin:/bin' \
                              'PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.getent ]}'
             # bwrap is pinned ahead of the host's: the sandbox depends on its
             # exact flag behaviour. Everything else is a fallback.
-            # CLAUDE_BOX_SELF is the wrapper's own path. The privilege drop
-            # re-execs claude-box under sudo, and it has to be this wrapper
+            # AGENT_BOX_SELF is the wrapper's own path. The privilege drop
+            # re-execs agent-box under sudo, and it has to be this wrapper
             # rather than the wrapped script: sudo resets the environment, so
             # the PATH set up here is what puts bubblewrap and the toolchain
             # back for the second phase.
-            wrapProgram $out/bin/claude-box \
+            wrapProgram $out/bin/agent-box \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
               --suffix PATH : ${pkgs.lib.makeBinPath (toolchain pkgs)} \
-              --set CLAUDE_BOX_SELF $out/bin/claude-box \
-              --set CLAUDE_BOX_MOUNT $out/bin/claude-box-mount \
+              --set AGENT_BOX_SELF $out/bin/agent-box \
+              --set AGENT_BOX_MOUNT $out/bin/agent-box-mount \
               --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             runHook postInstall
           '';
           meta = with pkgs.lib; {
             description = "Run a command confined to the current project directory";
             platforms = platforms.linux;
-            mainProgram = "claude-box";
+            mainProgram = "agent-box";
           };
         };
-        default = claude-box;
+        default = agent-box;
       });
 
       apps = forAllSystems (pkgs: rec {
-        claude-box = {
+        agent-box = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.claude-box}/bin/claude-box";
+          program = "${self.packages.${pkgs.system}.agent-box}/bin/agent-box";
         };
-        default = claude-box;
+        default = agent-box;
       });
     };
 }

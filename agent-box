@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# claude-box — run a command (Claude Code by default) confined to the current
+# agent-box — run a command (Claude Code by default) confined to the current
 # project directory.
 #
-# Uses bubblewrap (user namespaces) to give Claude Code a private mount, PID,
+# Uses bubblewrap (user namespaces) to give the command a private mount, PID,
 # IPC, UTS and cgroup namespace. The project directory is the only writable
 # path outside the sandbox's own tmpfs; $HOME is replaced by a tmpfs so other
 # projects, SSH keys and shell history are simply not there.
@@ -16,22 +16,22 @@
 # without binding anything under the real $HOME. The Nix daemon socket is passed
 # through as well, so builds work inside; see --no-nix.
 #
-# The sandbox runs as a separate unprivileged user (set in claude-box-mount).
+# The sandbox runs as a separate unprivileged user (set in agent-box-mount).
 # The Nix daemon decides client trust from the peer's uid and a user namespace
 # cannot change that, so a sandbox running as a trusted user could set
 # build-hook, post-build-hook, extra-sandbox-paths or substituters on the
 # daemon — which is root-equivalent in practice. Running as an untrusted uid
 # removes that, and the invoking user's own files become unreachable by plain
 # file permissions rather than by bwrap's binds alone. The switch goes through
-# `sudo claude-box-mount` and is printed before it runs. That small fixed helper
+# `sudo agent-box-mount` and is printed before it runs. That small fixed helper
 # gives the box the few paths it needs through idmapped mounts: the box sees
 # them as its own, and what it creates there lands on disk as the invoking
 # user's.
 
 set -euo pipefail
 
-die() { printf 'claude-box: %s\n' "$*" >&2; exit 1; }
-note() { printf 'claude-box: %s\n' "$*" >&2; }
+die() { printf 'agent-box: %s\n' "$*" >&2; exit 1; }
+note() { printf 'agent-box: %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------- arguments --
 
@@ -66,16 +66,16 @@ internal_env=()
 
 usage() {
     cat <<'USAGE'
-Usage: claude-box [options] [--] [command [args...]]
+Usage: agent-box [options] [--] [command [args...]]
 
 Runs a command confined to the project directory. The command defaults to
 `claude --continue`, resuming the project's last conversation (plain
 `claude` if there is none yet); give another one to inspect or test the
 sandbox from inside.
 
-The sandbox runs as an unprivileged user (set in claude-box-mount) so that
+The sandbox runs as an unprivileged user (set in agent-box-mount) so that
 its Nix daemon connection is untrusted. The switch goes through
-`sudo claude-box-mount`, which also hands the box the project and its state
+`sudo agent-box-mount`, which also hands the box the project and its state
 directory through idmapped mounts: files the box creates are owned by you.
 
 Options:
@@ -91,16 +91,16 @@ Options:
       --dry-run       Print the command that would run, then exit
   -h, --help          Show this help
 
-Use -- to separate the command from claude-box's own options.
+Use -- to separate the command from agent-box's own options.
 
 Examples:
-  claude-box                                   # confine to $PWD, resume claude
-  claude-box --new                             # ...or start a new conversation
-  claude-box --ro-bind ~/.gitconfig            # let git commit work
-  claude-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
-  claude-box bash                              # poke around inside the sandbox
-  claude-box -- env                            # see the scrubbed environment
-  claude-box --offline -- ls -la /             # what the filesystem looks like
+  agent-box                                   # confine to $PWD, resume claude
+  agent-box --new                             # ...or start a new conversation
+  agent-box --ro-bind ~/.gitconfig            # let git commit work
+  agent-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
+  agent-box bash                              # poke around inside the sandbox
+  agent-box -- env                            # see the scrubbed environment
+  agent-box --offline -- ls -la /             # what the filesystem looks like
 USAGE
 }
 
@@ -148,7 +148,7 @@ done
 # itself. Catch the old form rather than failing with a bare execvp error.
 if [[ ${#cmd[@]} -gt 0 && ${cmd[0]} == -* ]]; then
     die "'${cmd[0]}' is the command to run, not an argument to claude.
-             did you mean: claude-box -- claude ${cmd[*]}"
+             did you mean: agent-box -- claude ${cmd[*]}"
 fi
 
 # Only the default command gets --continue; an explicit one runs verbatim.
@@ -207,7 +207,7 @@ compute_state_root() {
     local slug hash
     slug="$(printf '%s' "${project#/}" | tr '/' '%')"
     hash="$(printf '%s' "$project" | cksum | cut -d' ' -f1)"
-    state_root="${XDG_STATE_HOME:-$HOME/.local/state}/claude-box/${slug}-${hash}"
+    state_root="${XDG_STATE_HOME:-$HOME/.local/state}/agent-box/${slug}-${hash}"
 }
 
 # Runs as the invoking user only: the box user has no business being able to
@@ -254,7 +254,7 @@ PY
 # ------------------------------------------------------------------- access --
 
 # The host paths the sandbox binds, as mode/path pairs. Those owned by the
-# invoking user — normally all of them — are handed to claude-box-mount, which
+# invoking user — normally all of them — are handed to agent-box-mount, which
 # presents them idmapped so that the box works on them as their owner. Anything
 # else (a --ro-bind of a system file, say) is bound as it is and has to be
 # reachable by the box user on its own permissions.
@@ -294,17 +294,17 @@ build_binds() {
     return 0
 }
 
-# Phase 2: where each host path is bound from. claude-box-mount stages the
-# shares, in the order given, as $CLAUDE_BOX_STAGE/0, /1, ...
+# Phase 2: where each host path is bound from. agent-box-mount stages the
+# shares, in the order given, as $AGENT_BOX_STAGE/0, /1, ...
 declare -A bind_src=()
 
 resolve_sources() {
     local i
     if [[ ${#shares[@]} -gt 0 ]]; then
-        [[ -n "${CLAUDE_BOX_STAGE:-}" ]] \
-            || die "CLAUDE_BOX_STAGE is not set — phase 2 must be started by claude-box-mount"
+        [[ -n "${AGENT_BOX_STAGE:-}" ]] \
+            || die "AGENT_BOX_STAGE is not set — phase 2 must be started by agent-box-mount"
         for ((i = 0; i < ${#shares[@]}; i += 2)); do
-            bind_src[${shares[i+1]}]="$CLAUDE_BOX_STAGE/$((i / 2))"
+            bind_src[${shares[i+1]}]="$AGENT_BOX_STAGE/$((i / 2))"
         done
     fi
 }
@@ -330,7 +330,7 @@ check_access() {
     [[ ${#bad[@]} -eq 0 ]] && return 0
 
     {
-        printf 'claude-box: running as %s (uid %s), which cannot reach:\n' \
+        printf 'agent-box: running as %s (uid %s), which cannot reach:\n' \
             "$(id -un)" "$(id -u)"
         printf '  %s\n' "${bad[@]}"
         printf '\nPaths you own are idmapped and always reachable; these are not yours,\n'
@@ -356,7 +356,7 @@ fi
 # Phase 1, still the invoking user: do everything that has to be done as them —
 # resolving symlink chains through 0700 directories, creating and seeding the
 # state directory, deciding what gets bound — then re-exec as the box user
-# through claude-box-mount. Phase 2 is this same script with
+# through agent-box-mount. Phase 2 is this same script with
 # --internal-switched, and is where the sandbox gets built.
 #
 # The switch must happen out here: inside bwrap all capabilities are dropped,
@@ -364,13 +364,13 @@ fi
 # what the Nix daemon sees over SO_PEERCRED.
 if [[ $internal_switched -eq 0 ]]; then
     command -v sudo >/dev/null 2>&1 \
-        || die "sudo not found — it is how claude-box drops to the box user"
+        || die "sudo not found — it is how agent-box drops to the box user"
 
     # The wrapper, not the wrapped script: it is what puts bubblewrap and the
     # toolchain back on $PATH after the environment has been reset.
-    self="${CLAUDE_BOX_SELF:-$(realpath -- "$0")}"
-    mount_helper="${CLAUDE_BOX_MOUNT:-$(dirname -- "$self")/claude-box-mount}"
-    [[ -x "$mount_helper" ]] || die "claude-box-mount not found at $mount_helper"
+    self="${AGENT_BOX_SELF:-$(realpath -- "$0")}"
+    mount_helper="${AGENT_BOX_MOUNT:-$(dirname -- "$self")/agent-box-mount}"
+    [[ -x "$mount_helper" ]] || die "agent-box-mount not found at $mount_helper"
 
     if [[ $share_claude -eq 0 ]]; then
         compute_state_root
@@ -386,11 +386,11 @@ if [[ $internal_switched -eq 0 ]]; then
     # it can be world readable, as the box user has to read it.
     # /tmp explicitly, not $TMPDIR: the box user has to be able to read this,
     # and a per-session TMPDIR is routinely private to its owner.
-    handoff="$(mktemp /tmp/claude-box-handoff.XXXXXXXX)"
+    handoff="$(mktemp /tmp/agent-box-handoff.XXXXXXXX)"
     trap 'rm -f -- "$handoff"' EXIT INT TERM
     chmod 644 -- "$handoff"
     {
-        printf '# claude-box: handed to the box user for this run; safe to delete.\n'
+        printf '# agent-box: handed to the box user for this run; safe to delete.\n'
         printf 'project=%q\n' "$project"
         printf 'project_mode=%q\n' "$project_mode"
         printf 'state_root=%q\n' "$state_root"
@@ -420,7 +420,7 @@ if [[ $internal_switched -eq 0 ]]; then
             [[ -n "${!var:-}" ]] && printf 'internal_env+=(%q)\n' "$var=${!var}"
         done
         # The bind lists, classified here while they are all reachable. The
-        # shares must stay in the order claude-box-mount is given them.
+        # shares must stay in the order agent-box-mount is given them.
         for pathspec in "${extra_rw[@]}"; do printf 'extra_rw+=(%q)\n' "$pathspec"; done
         for pathspec in "${extra_ro[@]}"; do printf 'extra_ro+=(%q)\n' "$pathspec"; done
         for pathspec in "${binds[@]}"; do printf 'binds+=(%q)\n' "$pathspec"; done
@@ -440,7 +440,7 @@ if [[ $internal_switched -eq 0 ]]; then
               "${orig_args[@]}")
 
     note "Switching to box user"
-    { printf 'claude-box: +'; printf ' %q' "${sudo_cmd[@]}"; printf '\n'; } >&2
+    { printf 'agent-box: +'; printf ' %q' "${sudo_cmd[@]}"; printf '\n'; } >&2
 
     # A dry run stops at the switch rather than asking for a password: the line
     # just printed is runnable as it stands, and running it is what shows the
@@ -457,7 +457,7 @@ if [[ $internal_switched -eq 0 ]]; then
     exit $rc
 fi
 
-# Phase 2, as the box user, inside claude-box-mount's mount namespace.
+# Phase 2, as the box user, inside agent-box-mount's mount namespace.
 resolve_sources
 check_access
 
@@ -680,7 +680,7 @@ if [[ $nix_ok -eq 1 ]] && command -v nix >/dev/null 2>&1; then
                  2>/dev/null | tr -d '[:space:]' | grep -o '"trusted":[a-z0-9]*' || true)"
     case "$trusted" in
         '"trusted":true'|'"trusted":1')
-            die "the Nix daemon still trusts this uid ($box_user_name): it is listed in trusted-users (nix.conf), so the sandbox would be able to set build-hook and friends. Set a different box_user in claude-box-mount." ;;
+            die "the Nix daemon still trusts this uid ($box_user_name): it is listed in trusted-users (nix.conf), so the sandbox would be able to set build-hook and friends. Set a different box_user in agent-box-mount." ;;
     esac
 fi
 
@@ -699,7 +699,7 @@ bwrap_args=(
     --unshare-ipc
     --unshare-uts
     --unshare-cgroup
-    --hostname claude-box
+    --hostname agent-box
     --cap-drop ALL
     --die-with-parent
     --chdir "$project"

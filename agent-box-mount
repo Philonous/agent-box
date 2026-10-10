@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# claude-box-mount — the one part of claude-box that runs as root, via sudo.
+# agent-box-mount — the one part of agent-box that runs as root, via sudo.
 #
-# Usage: sudo claude-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]
+# Usage: sudo agent-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]
 #
 # In a private mount namespace, exposes each PATH through an idmapped bind
 # mount on which the invoking user's uid and primary gid read as the box
@@ -22,13 +22,13 @@
 set -euo pipefail
 
 # The unprivileged user the sandbox runs as — the single place it is set.
-# It must not be in nix.conf's trusted-users; claude-box asserts that inside.
+# It must not be in nix.conf's trusted-users; agent-box asserts that inside.
 box_user=agents
 
 PATH=/run/current-system/sw/bin:/usr/bin:/bin   # pinned by the flake
-stage=/run/claude-box
+stage=/run/agent-box
 
-die() { printf 'claude-box-mount: %s\n' "$*" >&2; exit 1; }
+die() { printf 'agent-box-mount: %s\n' "$*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || die "must be run as root, through sudo"
 host_uid="${SUDO_UID:-}"
@@ -52,7 +52,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do
     [[ $2 == /* ]] || die "not an absolute path: $2"
     modes+=("$1"); paths+=("$2"); shift 2
 done
-[[ $# -ge 2 ]] || die "usage: claude-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]"
+[[ $# -ge 2 ]] || die "usage: agent-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]"
 shift
 
 # Into a private mount namespace first, so nothing below is visible on the host.
@@ -63,7 +63,7 @@ fi
 
 # Somewhere the box user can reach without traversing the invoker's 0700 $HOME.
 mkdir -p "$stage"
-mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=64k claude-box "$stage"
+mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=64k agent-box "$stage"
 
 # On-disk id first, the id it reads as second — the reverse of what mount(8)
 # documents, verified empirically (util-linux 2.42, kernel 6.18). Both u and g
@@ -92,4 +92,4 @@ done
 # such as sudo. Unprivileged user namespaces, which bwrap uses, still work.
 exec setpriv --reuid="$box_uid" --regid="$box_gid" --init-groups --no-new-privs -- \
     env -i HOME="$box_home" USER="$box_user" LOGNAME="$box_user" \
-           PATH="$PATH" CLAUDE_BOX_STAGE="$stage" "$@"
+           PATH="$PATH" AGENT_BOX_STAGE="$stage" "$@"

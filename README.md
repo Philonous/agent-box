@@ -1,13 +1,13 @@
-# claude-box
+# agent-box
 
-Run Claude Code — or any other command — confined to a single project
-directory, using
+Run an AI coding agent (Claude Code by default) — or any other command —
+confined to a single project directory, using
 [bubblewrap](https://github.com/containers/bubblewrap) instead of Docker.
 
-Claude Code normally runs with your full ambient authority: it can read every
-file under `$HOME` (other projects, SSH keys, browser profiles, shell history),
-see and signal every process on the machine, and write anywhere you can.
-`claude-box` puts it in a namespace jail where the project directory is the only
+Coding agents normally run with your full ambient authority: they can read
+every file under `$HOME` (other projects, SSH keys, browser profiles, shell
+history), see and signal every process on the machine, and write anywhere you
+can. `agent-box` puts the agent in a namespace jail where the project directory is the only
 writable path outside its own tmpfs, running as a **separate unprivileged user**
 so that the Nix daemon treats it as an untrusted client and your own files are
 out of reach by file permissions, not just by what is bound.
@@ -17,37 +17,37 @@ It is a single bash script. There is no image to build and no daemon.
 ## Usage
 
 ```sh
-nix run github:you/claude-box                 # no install needed, see below
+nix run github:you/agent-box                 # no install needed, see below
 ```
 
 ```sh
-./claude-box                                  # confine to $PWD, resume claude
-./claude-box --new                            # start a fresh conversation
-./claude-box -d ~/src/foo                     # confine to another directory
-./claude-box -- claude -p 'run the tests'     # pass args through to claude
-./claude-box --dry-run                        # print the bwrap command, don't run
+./agent-box                                  # confine to $PWD, resume claude
+./agent-box --new                            # start a fresh conversation
+./agent-box -d ~/src/foo                     # confine to another directory
+./agent-box -- claude -p 'run the tests'     # pass args through to claude
+./agent-box --dry-run                        # print the bwrap command, don't run
 ```
 
 The command defaults to `claude --continue`, resuming the project's last
 conversation; `--new` starts a fresh one instead. On a project with no
 conversation yet, plain `claude` is run, since `--continue` would fail there.
-An explicitly given command (`claude-box -- claude ...`) is always run verbatim.
+An explicitly given command (`agent-box -- claude ...`) is always run verbatim.
 
 Any other command works too, which is the easiest
 way to see what the sandbox actually looks like from inside:
 
 ```sh
-./claude-box bash                             # interactive shell in the jail
-./claude-box -- env                            # inspect the scrubbed environment
-./claude-box -- ls -a ~                        # $HOME really is an empty tmpfs
-./claude-box --offline -- npm test             # run a build with no network
-./claude-box -- nix build .#foo                # daemon builds work inside
+./agent-box bash                             # interactive shell in the jail
+./agent-box -- env                            # inspect the scrubbed environment
+./agent-box -- ls -a ~                        # $HOME really is an empty tmpfs
+./agent-box --offline -- npm test             # run a build with no network
+./agent-box -- nix build .#foo                # daemon builds work inside
 ```
 
-Use `--` to separate the command from `claude-box`'s own options. A command
+Use `--` to separate the command from `agent-box`'s own options. A command
 whose first word starts with `-` is rejected rather than guessed at, so the
-older `claude-box -- -p '...'` form now tells you to write
-`claude-box -- claude -p '...'`.
+older `agent-box -- -p '...'` form now tells you to write
+`agent-box -- claude -p '...'`.
 
 | Flag | Effect |
 |---|---|
@@ -69,9 +69,9 @@ Everything after `--` is the command line to run, verbatim.
 | | |
 |---|---|
 | **Filesystem** | `$HOME` is a tmpfs. Only the project directory is bound read-write. `/nix/store` and `/etc` are read-only. `/tmp` and `/var/tmp` are tmpfs. |
-| **Processes** | Private PID namespace — Claude sees ~5 processes instead of your full table, and cannot signal anything on the host. |
-| **IPC / UTS / cgroup** | Separate namespaces; hostname reads as `claude-box`. |
-| **User** | A separate unprivileged user (`agents`, set in `claude-box-mount`), so your own files are unreachable by permissions and the Nix daemon sees an untrusted client. Files it creates are still owned by you (see below). |
+| **Processes** | Private PID namespace — the agent sees ~5 processes instead of your full table, and cannot signal anything on the host. |
+| **IPC / UTS / cgroup** | Separate namespaces; hostname reads as `agent-box`. |
+| **User** | A separate unprivileged user (`agents`, set in `agent-box-mount`), so your own files are unreachable by permissions and the Nix daemon sees an untrusted client. Files it creates are still owned by you (see below). |
 | **Capabilities** | All dropped, plus `no_new_privs` — the setuid binaries under `/run/wrappers` cannot elevate inside. |
 | **Environment** | `--clearenv`, then only locale/terminal and `ANTHROPIC_*` variables are re-set, so stray `AWS_*` / `GITHUB_TOKEN` values in your shell do not leak in. |
 | **Lifetime** | `--die-with-parent`: the sandbox dies with the launcher. |
@@ -81,10 +81,10 @@ the empty path chain `~/projects/foo/`, not `foo`'s other children.
 
 ## Running as a separate user
 
-The sandbox does not run as you. On startup `claude-box` re-execs itself
-through `sudo claude-box-mount`, a small fixed helper that drops to an
+The sandbox does not run as you. On startup `agent-box` re-execs itself
+through `sudo agent-box-mount`, a small fixed helper that drops to an
 unprivileged user, and only then builds the sandbox. The user is `agents`; to
-change it, edit the `box_user=` line in `claude-box-mount` — that line is the
+change it, edit the `box_user=` line in `agent-box-mount` — that line is the
 only place it is set.
 
 The reason is the Nix daemon. It decides whether a client is trusted from the
@@ -94,7 +94,7 @@ you are in `trusted-users`, a sandbox running as you can tell the daemon to use
 a different `build-hook`, `post-build-hook` or `substituters`, or to add
 `extra-sandbox-paths` that read host files into a build. That is
 root-equivalent in practice. As a uid that is not trusted, those settings are
-ignored with a warning instead. `claude-box` verifies it rather than assuming
+ignored with a warning instead. `agent-box` verifies it rather than assuming
 it, and refuses to launch if the daemon still reports `"trusted":true`:
 
 ```sh
@@ -104,13 +104,13 @@ nix store info --json          # inside the box: {"trusted":false,...}
 The privilege drop is always printed before it runs, in full:
 
 ```
-claude-box: switching to the box user — the Nix daemon decides client trust by uid
-claude-box: + sudo -- /nix/store/...-claude-box/bin/claude-box-mount \
-    rw /home/you/src/foo rw /home/you/.local/state/claude-box/home%you%src%foo-123 \
+agent-box: switching to the box user — the Nix daemon decides client trust by uid
+agent-box: + sudo -- /nix/store/...-agent-box/bin/agent-box-mount \
+    rw /home/you/src/foo rw /home/you/.local/state/agent-box/home%you%src%foo-123 \
     rw /home/you/.claude/.credentials.json \
-    -- /nix/store/...-claude-box/bin/claude-box \
+    -- /nix/store/...-agent-box/bin/agent-box \
     --internal-switched --internal-user you --internal-home /home/you \
-    --internal-handoff /tmp/claude-box-handoff.Ab3kR9
+    --internal-handoff /tmp/agent-box-handoff.Ab3kR9
 ```
 
 The handoff file is how the second phase learns what the first worked out — the
@@ -119,15 +119,15 @@ the scrubbed `NIX_CONFIG`. It is kept out of the command line so that the line
 above stays short enough to read, and out of the environment because `sudo`
 resets that unless the sudoers rule says `SETENV`. It is world-readable and
 contains no secrets, by design: `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`
-are *not* carried across, and claude-box says so when they are set.
+are *not* carried across, and agent-box says so when they are set.
 
 ### File ownership: idmapped mounts
 
 The box user cannot normally read your project (`~/projects` is typically
-`0700`), and anything it wrote would be owned by it. `claude-box-mount` solves
+`0700`), and anything it wrote would be owned by it. `agent-box-mount` solves
 both with [idmapped mounts](https://docs.kernel.org/filesystems/idmappings.html).
 In a private mount namespace, it bind-mounts each path it is given under
-`/run/claude-box/N`, mapped so that your uid and primary gid read as the box
+`/run/agent-box/N`, mapped so that your uid and primary gid read as the box
 user's. Then it drops to the box user. bwrap binds those copies back to their
 real paths inside the sandbox.
 
@@ -137,11 +137,11 @@ The effect:
 - Whatever the box creates lands on disk as **you** (`you:users`), so there is
   nothing to chown back and no ACLs to manage.
 - Your `0700` ancestors stay `0700`. The staged copies are reached through
-  `/run/claude-box`, not through your `$HOME`.
+  `/run/agent-box`, not through your `$HOME`.
 - The mounts exist only in that namespace. Outside the box, the user `agents`
   still cannot reach any of your files.
 
-`claude-box-mount` is the only part that runs as root, so it is deliberately
+`agent-box-mount` is the only part that runs as root, so it is deliberately
 small and strict:
 
 - The box user is a constant in the script, not an argument.
@@ -157,7 +157,7 @@ small and strict:
 
 A `--bind`/`--ro-bind` path you don't own (a system file, say) is not idmapped.
 It is bound as it is, and the box user has to be able to reach it on its own
-permissions; `claude-box` says so if it can't.
+permissions; `agent-box` says so if it can't.
 
 The binds are not recursive: a filesystem mounted *inside* the project
 directory does not appear in the box.
@@ -175,14 +175,14 @@ sudo chown -R --from=agents you:users ~/src/foo
 setfacl -R -x u:agents -x d:u:agents -x d:u:you ~/src/foo
 ```
 
-Do the same for `~/.local/state/claude-box` and, if you shared it,
+Do the same for `~/.local/state/agent-box` and, if you shared it,
 `~/.claude/.credentials.json`. Then remove the `x` entries on ancestors such as
 `setfacl -x u:agents ~/src`.
 
 ## Per-project Claude state
 
 Each project gets its own state directory under
-`~/.local/state/claude-box/<slug>`, holding a private `.claude/` and
+`~/.local/state/agent-box/<slug>`, holding a private `.claude/` and
 `.claude.json`. Transcripts, session history and todos from one project are
 invisible to another.
 
@@ -198,7 +198,7 @@ Two details make this painless:
   the sandbox rotate the OAuth refresh token and silently invalidate your host
   login; sharing the one file keeps them in sync while exposing nothing else.
 
-That credentials file is shared through `claude-box-mount` like the project, so
+That credentials file is shared through `agent-box-mount` like the project, so
 it is reachable only from inside the box's mount namespace, for as long as the
 box runs.
 
@@ -221,7 +221,7 @@ these to `PATH` as a *suffix*, so anything you already have keeps winning:
 `fd`, `jq`, `tree`, `nix`, `python3`, `nodejs`, `curl`, `gnutar`, `gzip`, `xz`,
 `unzip`.
 
-This matters more than it looks: `claude-box` builds the sandbox's `PATH` from
+This matters more than it looks: `agent-box` builds the sandbox's `PATH` from
 the host's minus the `$HOME` entries, so a Claude Code installed under
 `~/.local/bin` or an npm global prefix is *not* visible inside. The store paths
 above are.
@@ -286,18 +286,18 @@ against the read-only store. See the note in Limitations for what this costs.
   `--symlink` over an existing link with a different target aborts bwrap.
 
 Claude Code's own Bash sandbox also uses bubblewrap. Nested bubblewrap works
-inside `claude-box`, and the script deliberately does **not** pass
+inside `agent-box`, and the script deliberately does **not** pass
 `--unshare-user`, which would break it.
 
 ## Limitations
 
 These are real, and worth reading before relying on this.
 
-- **Network egress is unrestricted.** Claude needs `api.anthropic.com`, and
-  without a filtering proxy there is no way to allow that while blocking
+- **Network egress is unrestricted.** The agent needs its API endpoint
+  (`api.anthropic.com` for Claude), and without a filtering proxy there is no way to allow that while blocking
   everything else. An agent determined to exfiltrate the project's contents
   still can. This is the largest residual hole; `--offline` is the only
-  mitigation offered, and it disables Claude entirely.
+  mitigation offered, and it disables the agent entirely.
 - **The Nix daemon is reachable.** `nix build` inside the sandbox is a request
   to a root process outside it. The daemon has its own build sandbox and its own
   network access, so this is a channel the confinement does not cover. It is
@@ -325,9 +325,9 @@ user switch:
 
 - **The box user.** An unprivileged account that is *not* in `trusted-users`
   (`nix.conf`). It is `agents` unless you change `box_user=` in
-  `claude-box-mount`. It needs no home directory, shell or group of its own.
-- **A sudo rule** letting you run `claude-box-mount` as root, e.g.
-  `you ALL=(root) NOPASSWD: /nix/store/...-claude-box/bin/claude-box-mount` —
+  `agent-box-mount`. It needs no home directory, shell or group of its own.
+- **A sudo rule** letting you run `agent-box-mount` as root, e.g.
+  `you ALL=(root) NOPASSWD: /nix/store/...-agent-box/bin/agent-box-mount` —
   or no rule beyond plain sudo access, and type your password at each start.
   On NixOS:
 
@@ -335,7 +335,7 @@ user switch:
   security.sudo.extraRules = [{
     users = [ "you" ];
     commands = [{
-      command = "${claude-box}/bin/claude-box-mount";
+      command = "${agent-box}/bin/agent-box-mount";
       options = [ "NOPASSWD" ];
     }];
   }];
@@ -348,6 +348,6 @@ user switch:
 
 Everything else — `bubblewrap`, `python3` or `jq` for first-run config seeding,
 and the toolchain the sandbox sees — comes from the flake, which also pins
-`claude-box-mount`'s `PATH` to store paths. Running the scripts directly rather
+`agent-box-mount`'s `PATH` to store paths. Running the scripts directly rather
 than through Nix needs `bubblewrap` and util-linux (`mount`, `unshare`,
-`setpriv`) installed, with `claude-box-mount` next to `claude-box`.
+`setpriv`) installed, with `agent-box-mount` next to `agent-box`.
