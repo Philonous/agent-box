@@ -31,7 +31,9 @@ nix run github:you/agent-box                 # no install needed, see below
 The command defaults to `claude --continue`, resuming the project's last
 conversation; `--new` starts a fresh one instead. On a project with no
 conversation yet, plain `claude` is run, since `--continue` would fail there.
-An explicitly given command (`agent-box -- claude ...`) is always run verbatim.
+The default command also gets `--append-system-prompt` telling Claude it is in
+a restricted sandbox, so it doesn't read missing tools or paths as facts about
+the project. An explicitly given command (`agent-box -- claude ...`) is always run verbatim.
 
 Any other command works too, which is the easiest
 way to see what the sandbox actually looks like from inside:

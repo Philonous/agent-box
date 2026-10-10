@@ -70,7 +70,8 @@ Usage: agent-box [options] [--] [command [args...]]
 
 Runs a command confined to the project directory. The command defaults to
 `claude --continue`, resuming the project's last conversation (plain
-`claude` if there is none yet); give another one to inspect or test the
+`claude` if there is none yet), with a system-prompt note that it runs in
+a sandbox; give another one to inspect or test the
 sandbox from inside.
 
 The sandbox runs as an unprivileged user (set in agent-box-mount) so that
@@ -585,6 +586,16 @@ if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
     if [[ -e ${transcript_files[0]} ]]; then
         cmd+=(--continue)
     fi
+fi
+
+# Tell the default claude where it is. Without this it reads a missing tool, an
+# empty $HOME or an unreachable path as a fact about the project or the user's
+# machine, and either reports it as such or tries to "fix" it. Not persisted:
+# the system prompt is rebuilt on every launch, --continue included.
+if [[ $default_cmd -eq 1 ]]; then
+    cmd+=(--append-system-prompt "You are running inside a restricted \
+sandbox. Do not make assumptions about the project based on the environment. \
+Do not try to work around the sandbox, instead, ask the user")
 fi
 
 # -------------------------------------------------------------- environment --

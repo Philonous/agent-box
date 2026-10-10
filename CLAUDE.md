@@ -7,9 +7,8 @@
 * The agent's own Bash sandbox has a minimal PATH: no coreutils, bash, or nix,
   and no `/usr/bin/env` (so `./agent-box` fails with "bad interpreter").
   Fix: `export PATH=/run/current-system/sw/bin:$PATH`, and run `bash ./agent-box`.
-* That sandbox binds /nix/store but not /nix/var, so `nix eval` works while
-  `nix build`/`nix run` fall back to a chroot store at ~/.local/share/nix/root
-  (grows to ~500MB of fetched sources) — don't build from here.
+* The agent sandbox now has /nix/var + daemon socket: `nix store info` reports
+  `"url":"daemon","trusted":false` (no chroot store fallback anymore).
 * `pkgs.claude-code` is unfree; the flake scopes an `allowUnfreePredicate` to it
   so `nix run .` needs no `--impure`.
 * Nix passthrough: /nix/var ro + daemon-socket rw. The profile `--symlink` loop
