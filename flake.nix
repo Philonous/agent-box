@@ -7,9 +7,7 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
 
-      # claude-code carries an unfree licence, so legacyPackages refuses to
-      # evaluate it. Allow that one package by name — a blanket allowUnfree
-      # would silently cover anything else added to the toolchain later.
+      # Allow only claude-code as unfree.
       pkgsFor = system: import nixpkgs {
         inherit system;
         config.allowUnfreePredicate = pkg:
@@ -17,33 +15,28 @@
       };
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
 
-      # The toolchain the sandbox gets. agent-box builds the sandbox's PATH by
-      # stripping the $HOME entries off the host's, so anything installed under
-      # $HOME (npm globals, ~/.local/bin) is *not* there — these store paths are
-      # what makes `nix run .` work on a machine with nothing installed.
-      #
-      # Appended as a suffix, so a tool the user already has still wins.
+      # Sandbox toolchain. agent-box drops $HOME entries from PATH, so this is
+      # what makes `nix run .` work on a bare machine. Appended, so host tools
+      # win.
       toolchain = pkgs: with pkgs; [
         claude-code
 
-        # shell and the POSIX basics the script and any agent lean on
+        # shell and POSIX basics
         bashInteractive coreutils findutils gnugrep gnused gawk
         diffutils patch less which procps
 
-        # sudo is deliberately absent: the privilege drop needs the host's
-        # setuid one, which a store copy could never be.
+        # no sudo: it must be the host's setuid one
 
         # version control and search
         git gh ripgrep fd jq tree
 
-        # the client half of the Nix daemon passthrough (see --no-nix)
+        # Nix daemon client (see --no-nix)
         nix
 
-        # runtimes: python3 also does agent-box's first-run config seeding
+        # runtimes; python3 also seeds agent-box's config
         python3 nodejs
 
-        # network and archives (cacert is not listed: it ships no bin/, it is
-        # referenced directly for SSL_CERT_FILE below)
+        # network and archives (cacert has no bin/; see SSL_CERT_FILE below)
         curl gnutar gzip xz unzip
       ];
     in
@@ -59,19 +52,14 @@
             install -Dm755 agent-box $out/bin/agent-box
             install -Dm755 agent-box-mount $out/bin/agent-box-mount
             patchShebangs $out/bin/agent-box $out/bin/agent-box-mount
-            # The helper runs as root, so its PATH is fixed to store paths rather
-            # than whatever the host has. Not wrapped: the sudoers rule should
-            # name the script itself, not a wrapper around it.
+            # Runs as root: PATH pinned to store paths. Not wrapped, so
+            # sudoers can name the script itself.
             substituteInPlace $out/bin/agent-box-mount \
               --replace-fail 'PATH=/run/current-system/sw/bin:/usr/bin:/bin' \
                              'PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.getent ]}'
-            # bwrap is pinned ahead of the host's: the sandbox depends on its
-            # exact flag behaviour. Everything else is a fallback.
-            # AGENT_BOX_SELF is the wrapper's own path. The privilege drop
-            # re-execs agent-box under sudo, and it has to be this wrapper
-            # rather than the wrapped script: sudo resets the environment, so
-            # the PATH set up here is what puts bubblewrap and the toolchain
-            # back for the second phase.
+            # bwrap pinned ahead of the host's; the toolchain is a fallback.
+            # AGENT_BOX_SELF: the privilege drop re-execs this wrapper, since
+            # sudo resets PATH.
             wrapProgram $out/bin/agent-box \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
               --suffix PATH : ${pkgs.lib.makeBinPath (toolchain pkgs)} \

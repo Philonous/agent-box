@@ -1,32 +1,14 @@
 #!/usr/bin/env bash
 #
-# agent-box — run a command (Claude Code by default) confined to the current
-# project directory.
+# agent-box: run a command (default: claude) confined to the project directory.
 #
-# Uses bubblewrap (user namespaces) to give the command a private mount, PID,
-# IPC, UTS and cgroup namespace. The project directory is the only writable
-# path outside the sandbox's own tmpfs; $HOME is replaced by a tmpfs so other
-# projects, SSH keys and shell history are simply not there.
+# bwrap with private mount/PID/IPC/UTS/cgroup namespaces. $HOME is a tmpfs; the
+# project is the only writable host path. Nix profile links are recreated and
+# the daemon socket is passed through (see --no-nix).
 #
-# The command defaults to `claude`, but any command can be given instead, which
-# is the easy way to inspect what the sandbox actually looks like from inside.
-#
-# Nix-aware: resolves the Nix profile chain to its store path and recreates it
-# as a symlink inside the sandbox, so the toolchain on $PATH keeps working
-# without binding anything under the real $HOME. The Nix daemon socket is passed
-# through as well, so builds work inside; see --no-nix.
-#
-# The sandbox runs as a separate unprivileged user (set in agent-box-mount).
-# The Nix daemon decides client trust from the peer's uid and a user namespace
-# cannot change that, so a sandbox running as a trusted user could set
-# build-hook, post-build-hook, extra-sandbox-paths or substituters on the
-# daemon — which is root-equivalent in practice. Running as an untrusted uid
-# removes that, and the invoking user's own files become unreachable by plain
-# file permissions rather than by bwrap's binds alone. The switch goes through
-# `sudo agent-box-mount` and is printed before it runs. That small fixed helper
-# gives the box the few paths it needs through idmapped mounts: the box sees
-# them as its own, and what it creates there lands on disk as the invoking
-# user's.
+# Runs as a separate, untrusted uid (box_user in agent-box-mount): The switch
+# goes through `sudo agent-box-mount`, which idmaps the needed paths so that
+# files the box creates are owned by the invoking user.
 
 set -euo pipefail
 
@@ -35,7 +17,7 @@ note() { printf 'agent-box: %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------- arguments --
 
-# Kept verbatim: the privilege drop re-execs this same script with them.
+# Passed on verbatim by the privilege drop.
 orig_args=("$@")
 
 project="$PWD"
@@ -52,10 +34,8 @@ extra_ro=()
 extra_env=()
 cmd=()
 
-# Set by the re-exec; see "privilege drop". Undocumented on purpose: they are
-# this script talking to itself across sudo, not a user interface. The bulk
-# travels in a handoff file rather than argv, so the sudo command line stays
-# short enough to actually read before it runs.
+# Internal: set by the re-exec across sudo. The rest comes from the handoff
+# file, which keeps the sudo command line short.
 internal_switched=0
 internal_home=""
 internal_user=""
@@ -68,16 +48,12 @@ usage() {
     cat <<'USAGE'
 Usage: agent-box [options] [--] [command [args...]]
 
-Runs a command confined to the project directory. The command defaults to
-`claude --continue`, resuming the project's last conversation (plain
-`claude` if there is none yet), with a system-prompt note that it runs in
-a sandbox; give another one to inspect or test the
-sandbox from inside.
+Runs a command confined to the project directory. The default command is
+`claude --continue` (plain `claude` if there is no conversation yet), told
+via the system prompt that it runs in a sandbox.
 
-The sandbox runs as an unprivileged user (set in agent-box-mount) so that
-its Nix daemon connection is untrusted. The switch goes through
-`sudo agent-box-mount`, which also hands the box the project and its state
-directory through idmapped mounts: files the box creates are owned by you.
+Runs as an unprivileged user via `sudo agent-box-mount`, which idmaps the
+project and state directory so files the box creates are owned by you.
 
 Options:
   -d, --dir PATH      Project root to confine to (default: current directory)
@@ -95,13 +71,9 @@ Options:
 Use -- to separate the command from agent-box's own options.
 
 Examples:
-  agent-box                                   # confine to $PWD, resume claude
-  agent-box --new                             # ...or start a new conversation
   agent-box --ro-bind ~/.gitconfig            # let git commit work
   agent-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
-  agent-box bash                              # poke around inside the sandbox
-  agent-box -- env                            # see the scrubbed environment
-  agent-box --offline -- ls -la /             # what the filesystem looks like
+  agent-box bash                              # shell inside the sandbox
 USAGE
 }
 
@@ -113,8 +85,7 @@ while [[ $# -gt 0 ]]; do
         --offline)     offline=1; shift ;;
         --no-nix)      nix_daemon=0; shift ;;
         --share-claude) share_claude=1; shift ;;
-        # Resolved by phase 1 only; phase 2 gets them from the handoff, as
-        # the box user may not be able to resolve them at all.
+        # Resolved in phase 1 only; phase 2 gets them from the handoff.
         --bind)        [[ $# -ge 2 ]] || die "--bind needs an argument"
                        if [[ $internal_switched -eq 0 ]]; then
                            bind_path="$(realpath -e -- "$2")" || die "no such path: $2"
@@ -145,14 +116,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Everything after -- used to be claude's arguments; it is now the command
-# itself. Catch the old form rather than failing with a bare execvp error.
+# Catch the old `agent-box -- -p ...` form.
 if [[ ${#cmd[@]} -gt 0 && ${cmd[0]} == -* ]]; then
     die "'${cmd[0]}' is the command to run, not an argument to claude.
              did you mean: agent-box -- claude ${cmd[*]}"
 fi
 
-# Only the default command gets --continue; an explicit one runs verbatim.
 default_cmd=0
 if [[ ${#cmd[@]} -eq 0 ]]; then
     cmd=(claude)
@@ -161,19 +130,16 @@ elif [[ $new_session -eq 1 ]]; then
     die "--new only applies to the default command, not '${cmd[0]}'"
 fi
 
-# On the far side of the switch, $HOME is the box user's and sudo has reset the
-# environment. Everything phase 1 worked out is read back here: the host paths
-# all belong to the invoking user, so put their $HOME back and keep using it.
+# Phase 2: sudo has reset the environment. Host paths belong to the invoking
+# user, so restore their $HOME.
 if [[ $internal_switched -eq 1 ]]; then
     [[ -n "$internal_home" ]] || die "--internal-switched requires --internal-home"
     [[ -n "$internal_user" ]] || die "--internal-switched requires --internal-user"
     [[ -n "$internal_handoff" ]] || die "--internal-switched requires --internal-handoff"
     [[ -f "$internal_handoff" ]] \
         || die "handoff file missing or unreadable by $(id -un): $internal_handoff"
-    # It gets sourced, so insist it belongs to the user who claims to have
-    # written it. mktemp created it under a unique name with mode 0644, and /tmp
-    # is sticky, so nobody else can have substituted or rewritten it. Reading it
-    # waits until every variable it sets has been declared, further down.
+    # It gets sourced (further down), so check its owner. mktemp plus sticky
+    # /tmp rule out substitution.
     handoff_uid="$(stat -c %u -- "$internal_handoff")"
     [[ "$handoff_uid" == "$(id -u "$internal_user")" ]] \
         || die "handoff file is not owned by $internal_user: $internal_handoff"
@@ -186,15 +152,12 @@ fi
 command -v bwrap >/dev/null 2>&1 \
     || die "bubblewrap (bwrap) not found. On NixOS: nix-shell -p bubblewrap"
 
-# Phase 1 resolved and validated the project; the box user may not even be
-# able to stat its real path, only the idmapped copy.
+# Phase 1 only: the box user may not be able to stat the real path.
 if [[ $internal_switched -eq 0 ]]; then
     [[ -d "$project" ]] || die "not a directory: $project"
     project="$(realpath -- "$project")"
 fi
 
-# Confining to $HOME or / would defeat the purpose; fail loudly rather than
-# pretend to sandbox.
 case "$project" in
     "$HOME"|/|/nix|/nix/*)
         die "refusing to use '$project' as the project root" ;;
@@ -211,19 +174,15 @@ compute_state_root() {
     state_root="${XDG_STATE_HOME:-$HOME/.local/state}/agent-box/${slug}-${hash}"
 }
 
-# Runs as the invoking user only: the box user has no business being able to
-# create directories under their $HOME. It reaches the result through the
-# idmapped mount, where these 0700/0600 modes read as its own.
+# Phase 1 only. The box user reaches the result through the idmapped mount.
 ensure_state_root() {
     [[ -d "$state_root" ]] && return 0
 
     mkdir -p "$state_root/claude"
     chmod 700 "$state_root" "$state_root/claude"
 
-    # Seed .claude.json from the host config minus the per-project history.
-    # Carrying the rest over preserves onboarding state, so a new project
-    # does not re-prompt for theme/trust; `projects` and `githubRepoPaths`
-    # are the fields that actually leak other work.
+    # Seed from the host config minus `projects` and `githubRepoPaths`, which
+    # leak other work. The rest avoids re-onboarding.
     local seeded=0
     if [[ -f "$HOME/.claude.json" ]]; then
         if command -v python3 >/dev/null 2>&1; then
@@ -254,11 +213,9 @@ PY
 
 # ------------------------------------------------------------------- access --
 
-# The host paths the sandbox binds, as mode/path pairs. Those owned by the
-# invoking user — normally all of them — are handed to agent-box-mount, which
-# presents them idmapped so that the box works on them as their owner. Anything
-# else (a --ro-bind of a system file, say) is bound as it is and has to be
-# reachable by the box user on its own permissions.
+# binds: mode/path pairs. shares: the subset owned by the invoking user, which
+# agent-box-mount idmaps. Other paths are bound as is and must be reachable by
+# the box user.
 binds=()
 shares=()
 
@@ -278,8 +235,6 @@ build_binds() {
         [[ -f "$HOME/.claude.json" ]] && binds+=(rw "$HOME/.claude.json")
     else
         binds+=(rw "$state_root")
-        # Bound read-write into the sandbox so box and host keep the same OAuth
-        # refresh token (see the bind below).
         [[ -f "$HOME/.claude/.credentials.json" ]] \
             && binds+=(rw "$HOME/.claude/.credentials.json")
     fi
@@ -295,8 +250,8 @@ build_binds() {
     return 0
 }
 
-# Phase 2: where each host path is bound from. agent-box-mount stages the
-# shares, in the order given, as $AGENT_BOX_STAGE/0, /1, ...
+# Phase 2: bind source per host path. agent-box-mount stages the shares, in
+# order, as $AGENT_BOX_STAGE/0, /1, ...
 declare -A bind_src=()
 
 resolve_sources() {
@@ -312,7 +267,7 @@ resolve_sources() {
 
 src_of() { printf '%s' "${bind_src[$1]:-$1}"; }
 
-# Run as the box user, so the kernel is the one answering.
+# Runs as the box user, so the kernel decides.
 check_access() {
     local -a bad=()
     local i mode p src
@@ -342,9 +297,6 @@ check_access() {
 
 # ----------------------------------------------------------------- handoff --
 
-# Now that everything it sets has been declared, read what phase 1 worked out:
-# the project, the state directory, the host $PATH, the resolved profile links,
-# the environment worth carrying, and the bind lists.
 if [[ $internal_switched -eq 1 ]]; then
     # shellcheck source=/dev/null
     . "$internal_handoff"
@@ -354,21 +306,17 @@ fi
 
 # ----------------------------------------------------------- privilege drop --
 
-# Phase 1, still the invoking user: do everything that has to be done as them —
-# resolving symlink chains through 0700 directories, creating and seeding the
-# state directory, deciding what gets bound — then re-exec as the box user
-# through agent-box-mount. Phase 2 is this same script with
-# --internal-switched, and is where the sandbox gets built.
+# Phase 1, as the invoking user: resolve paths, set up state, decide binds, then
+# re-exec as the box user through agent-box-mount with --internal-switched
+# (phase 2, which builds the sandbox).
 #
-# The switch must happen out here: inside bwrap all capabilities are dropped,
-# and bwrap's --uid only relabels the uid within its own namespace, which is not
-# what the Nix daemon sees over SO_PEERCRED.
+# This can't happen inside bwrap: capabilities are dropped there, and --uid
+# doesn't change the uid the Nix daemon sees via SO_PEERCRED.
 if [[ $internal_switched -eq 0 ]]; then
     command -v sudo >/dev/null 2>&1 \
         || die "sudo not found — it is how agent-box drops to the box user"
 
-    # The wrapper, not the wrapped script: it is what puts bubblewrap and the
-    # toolchain back on $PATH after the environment has been reset.
+    # The wrapper, not the script: it restores PATH after sudo resets it.
     self="${AGENT_BOX_SELF:-$(realpath -- "$0")}"
     mount_helper="${AGENT_BOX_MOUNT:-$(dirname -- "$self")/agent-box-mount}"
     [[ -x "$mount_helper" ]] || die "agent-box-mount not found at $mount_helper"
@@ -380,13 +328,9 @@ if [[ $internal_switched -eq 0 ]]; then
 
     build_binds
 
-    # The handoff. Everything phase 2 needs to rebuild what was worked out here,
-    # kept out of argv so the printed sudo line stays readable — and out of the
-    # environment, which sudo resets unless the sudoers rule says SETENV. It
-    # holds paths, $PATH and the scrubbed NIX_CONFIG; no secrets, which is why
-    # it can be world readable, as the box user has to read it.
-    # /tmp explicitly, not $TMPDIR: the box user has to be able to read this,
-    # and a per-session TMPDIR is routinely private to its owner.
+    # Handoff to phase 2. Not argv (keeps the sudo line readable), not the
+    # environment (sudo resets it). Holds no secrets, so it can be
+    # world-readable. /tmp, not $TMPDIR, which may be private.
     handoff="$(mktemp /tmp/agent-box-handoff.XXXXXXXX)"
     trap 'rm -f -- "$handoff"' EXIT INT TERM
     chmod 644 -- "$handoff"
@@ -396,8 +340,8 @@ if [[ $internal_switched -eq 0 ]]; then
         printf 'project_mode=%q\n' "$project_mode"
         printf 'state_root=%q\n' "$state_root"
         printf 'internal_path=%q\n' "$PATH"
-        # Resolved here because the chain runs through directories the box user
-        # has no business reading (~/.local/state is 0700 on a stock install).
+        # Resolved here: the chains run through directories the box user can't
+        # read.
         for link in \
             "$HOME/.nix-profile" \
             "$HOME/.local/state/nix/profile" \
@@ -410,9 +354,7 @@ if [[ $internal_switched -eq 0 ]]; then
                 /nix/store/*) printf 'internal_profiles+=(%q %q)\n' "$link" "$target" ;;
             esac
         done
-        # Non-secret environment the sandbox would otherwise lose. The
-        # ANTHROPIC_* secrets are deliberately not among them: a world-readable
-        # file is no place for them, so the box signs in once with its own state.
+        # Non-secret only; ANTHROPIC_API_KEY/AUTH_TOKEN stay behind.
         for var in TERM COLORTERM TERM_PROGRAM SHELL LANG LC_ALL LC_CTYPE TZ \
                    SSL_CERT_FILE NIX_SSL_CERT_FILE NIX_REMOTE NIX_PATH NIX_CONFIG \
                    ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
@@ -420,8 +362,7 @@ if [[ $internal_switched -eq 0 ]]; then
         do
             [[ -n "${!var:-}" ]] && printf 'internal_env+=(%q)\n' "$var=${!var}"
         done
-        # The bind lists, classified here while they are all reachable. The
-        # shares must stay in the order agent-box-mount is given them.
+        # shares must keep the order agent-box-mount receives them in.
         for pathspec in "${extra_rw[@]}"; do printf 'extra_rw+=(%q)\n' "$pathspec"; done
         for pathspec in "${extra_ro[@]}"; do printf 'extra_ro+=(%q)\n' "$pathspec"; done
         for pathspec in "${binds[@]}"; do printf 'binds+=(%q)\n' "$pathspec"; done
@@ -443,16 +384,14 @@ if [[ $internal_switched -eq 0 ]]; then
     note "Switching to box user"
     { printf 'agent-box: +'; printf ' %q' "${sudo_cmd[@]}"; printf '\n'; } >&2
 
-    # A dry run stops at the switch rather than asking for a password: the line
-    # just printed is runnable as it stands, and running it is what shows the
-    # bwrap command from the other side — so the handoff has to survive.
+    # Stop at the switch and keep the handoff, so the printed line can be run.
     if [[ $dry_run -eq 1 ]]; then
         trap - EXIT INT TERM
         note "handoff kept for that command: $handoff"
         exit 0
     fi
 
-    # Not exec: the handoff is this process's to clean up afterwards.
+    # Not exec: the trap removes the handoff afterwards.
     rc=0
     "${sudo_cmd[@]}" || rc=$?
     exit $rc
@@ -469,17 +408,11 @@ nix_args=()
 [[ -d /nix/store ]] || die "/nix/store not found — is this a Nix system?"
 nix_args+=(--ro-bind /nix/store /nix/store)
 
-# Builds are done by the daemon, which runs as root outside the sandbox, so
-# passing them through is a matter of reaching its socket — the store itself
-# stays read-only and every write to it remains the daemon's to make. /nix/var
-# is bound read-only for the client's sake: NIX_PATH channels live under
-# /nix/var/nix/profiles, and the daemon socket is re-bound read-write on top.
-# The connection is untrusted because of the uid we run as, not because of how
-# the socket is bound: a read-only bind mount does not stop connect(), since the
-# EROFS check exempts sockets.
+# The daemon builds outside the sandbox; only its socket is needed. /nix/var is
+# ro (NIX_PATH channels), the socket dir rw on top. A ro bind wouldn't stop
+# connect() anyway; the connection is untrusted because of our uid.
 #
-# --offline turns this off. The daemon fetches on the sandbox's behalf, so
-# leaving it connected would make that flag a lie.
+# Off with --offline: the daemon would fetch on our behalf.
 [[ $offline -eq 1 ]] && nix_daemon=0
 
 if [[ $nix_daemon -eq 1 && -S /nix/var/nix/daemon-socket/socket ]]; then
@@ -490,19 +423,16 @@ if [[ $nix_daemon -eq 1 && -S /nix/var/nix/daemon-socket/socket ]]; then
         || note "the Nix daemon socket is not writable by $(id -un); nix will not work inside"
 fi
 
-# NixOS runtime paths. Use -try so this also works on plain-Nix hosts.
+# NixOS runtime paths, if present.
 for p in /run/current-system /run/wrappers /run/opengl-driver /run/opengl-driver-32; do
     [[ -e "$p" ]] && nix_args+=(--ro-bind-try "$p" "$p")
 done
 
-# The toolchain lives behind symlink chains such as ~/.nix-profile, which the
-# tmpfs $HOME would erase. Resolve each to its store path and recreate the link
-# so $PATH keeps resolving, without binding any real $HOME content. These are
-# collected separately because they must be applied *after* the tmpfs.
+# Profile links like ~/.nix-profile, erased by the tmpfs $HOME. Recreated as
+# symlinks to their store paths, after the tmpfs.
 profile_args=()
 profile_links=()
 if [[ ${#internal_profiles[@]} -gt 0 ]]; then
-    # Already resolved as the invoking user, before the switch.
     profile_links=("${internal_profiles[@]}")
 else
     for link in \
@@ -522,25 +452,20 @@ while [[ ${#profile_links[@]} -gt 0 ]]; do
     link="${profile_links[0]}"
     target="${profile_links[1]}"
     profile_links=("${profile_links[@]:2}")
-    # Already present via the read-only /nix/var bind; --symlink over it would
-    # abort with EEXIST.
+    # Already there via the /nix/var bind; --symlink would fail with EEXIST.
     [[ $nix_ok -eq 1 && "$link" == /nix/var/* ]] && continue
     profile_args+=(--symlink "$target" "$link")
 done
-# /etc/profiles/per-user/$USER needs no handling: it already resolves through
-# the read-only /etc bind, and creating a symlink inside it would fail.
+# /etc/profiles/per-user resolves through the /etc bind.
 
-# /etc is needed for /etc/static (NixOS indirection), SSL certs, nsswitch and
-# DNS. Root-owned secrets (shadow, host keys) stay unreadable: we are an
-# unprivileged uid with all capabilities dropped.
+# /etc/static, certs, nsswitch, DNS. Root-only secrets stay unreadable to us.
 nix_args+=(--ro-bind /etc /etc)
 
 # ------------------------------------------------------ isolated claude state --
 
 state_args=()
 
-# Paths come from the bind list rather than from probing the host: the box user
-# cannot see the real ones, only their idmapped copies.
+# The box user can't see the real paths, so check the bind list.
 has_bind() {
     local i
     for ((i = 1; i < ${#binds[@]}; i += 2)); do
@@ -558,9 +483,7 @@ else
     state_args+=(--bind "$state_src/claude" "$HOME/.claude")
     state_args+=(--bind "$state_src/claude.json" "$HOME/.claude.json")
 
-    # Share only the credentials file, read-write. Copying it instead would let
-    # the sandbox rotate the OAuth refresh token and silently invalidate the
-    # host's login; a shared bind of this one file keeps them in sync.
+    # Shared, not copied: a copy's OAuth token rotation would log out the host.
     creds="$HOME/.claude/.credentials.json"
     has_bind "$creds" && state_args+=(--bind "$(src_of "$creds")" "$creds")
 fi
@@ -568,10 +491,8 @@ fi
 for p in "${extra_rw[@]}"; do extra_binds+=(--bind "$(src_of "$p")" "$p"); done
 for p in "${extra_ro[@]}"; do extra_binds+=(--ro-bind "$(src_of "$p")" "$p"); done
 
-# Resume the last conversation by default. `claude --continue` exits with an
-# error when there is nothing to resume, so only add it once this project has a
-# transcript. Claude keys transcripts by the project path with every
-# non-alphanumeric character replaced by '-'.
+# --continue fails without a transcript. Claude names the transcript dir after
+# the project path with non-alphanumerics replaced by '-'.
 if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
     if [[ $share_claude -eq 1 ]]; then
         claude_dir="$(src_of "$HOME/.claude")"
@@ -579,19 +500,16 @@ if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
         claude_dir="$(src_of "$state_root")/claude"
     fi
     transcripts="$claude_dir/projects/${project//[^a-zA-Z0-9]/-}"
-    # Not compgen: the minimal bash a Nix shebang resolves to is built
-    # without programmable completion. With nullglob off an unmatched glob
-    # stays literal, and -e on that literal is false.
+    # Not compgen: Nix's non-interactive bash lacks it. An unmatched glob stays
+    # literal and fails -e.
     transcript_files=("$transcripts"/*.jsonl)
     if [[ -e ${transcript_files[0]} ]]; then
         cmd+=(--continue)
     fi
 fi
 
-# Tell the default claude where it is. Without this it reads a missing tool, an
-# empty $HOME or an unreachable path as a fact about the project or the user's
-# machine, and either reports it as such or tries to "fix" it. Not persisted:
-# the system prompt is rebuilt on every launch, --continue included.
+# Otherwise claude takes missing tools or an empty $HOME as facts about the
+# machine and tries to fix them.
 if [[ $default_cmd -eq 1 ]]; then
     cmd+=(--append-system-prompt "You are running inside a restricted \
 sandbox. Do not make assumptions about the project based on the environment. \
@@ -600,13 +518,10 @@ fi
 
 # -------------------------------------------------------------- environment --
 
-# The host's $PATH, which on the far side of the switch arrives in argv: sudo
-# resets the environment, and the invoking user's profile entries are exactly
-# what the sandbox needs to keep.
+# sudo resets PATH; phase 2 gets the host's from the handoff.
 host_path="${internal_path:-$PATH}"
 
-# Drop $PATH entries under $HOME that will not exist inside the sandbox,
-# keeping the Nix profile paths we recreated as symlinks above.
+# Drop $HOME entries, except the recreated Nix profiles.
 sandbox_path=""
 while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
@@ -617,16 +532,12 @@ while IFS= read -r entry; do
     sandbox_path="${sandbox_path:+$sandbox_path:}$entry"
 done < <(printf '%s' "$host_path" | tr ':' '\n')
 
-# The sandbox PATH is the host's minus the $HOME entries, so a command can be
-# resolvable out here and missing in there. Say so plainly instead of letting
-# bwrap fail with a bare execvp error.
+# Clearer than bwrap's execvp error.
 if [[ ${cmd[0]} != */* ]]; then
     ( PATH="$sandbox_path"; hash -r; command -v -- "${cmd[0]}" ) >/dev/null 2>&1 \
         || die "command not found on the sandbox PATH: ${cmd[0]}"
 fi
 
-# The identity inside is the uid we actually run as, not the invoking user's:
-# $USER disagreeing with `id -un` confuses everything from git to npm.
 box_user_name="$(id -un)"
 
 env_args=(--clearenv)
@@ -636,20 +547,16 @@ env_args+=(--setenv LOGNAME "$box_user_name")
 env_args+=(--setenv PATH "$sandbox_path")
 env_args+=(--setenv PWD "$project")
 
-# Idmapped, the project reads as the box user's own. This still matters for a
-# project you do not own, which is bound as is: git refuses that as "dubious
-# ownership" unless the path is allowed.
+# For projects not owned by the user, which aren't idmapped: git would refuse
+# them as "dubious ownership".
 env_args+=(--setenv GIT_CONFIG_COUNT 1)
 env_args+=(--setenv GIT_CONFIG_KEY_0 safe.directory)
 env_args+=(--setenv GIT_CONFIG_VALUE_0 "$project")
 
-# NIX_PATH is what makes <nixpkgs> resolve; it points into /nix/var/nix/profiles,
-# which is bound above. Only pass them when the daemon actually came through.
 nix_env=()
 [[ $nix_ok -eq 1 ]] && nix_env=(NIX_REMOTE NIX_PATH)
 
-# Pass through only benign locale/terminal settings plus Anthropic config, so
-# unrelated secrets in the parent shell (AWS_*, GITHUB_TOKEN, ...) stay out.
+# Allowlist, so unrelated secrets (AWS_*, GITHUB_TOKEN, ...) stay out.
 for var in SHELL TERM COLORTERM TERM_PROGRAM LANG LC_ALL LC_CTYPE TZ \
            SSL_CERT_FILE NIX_SSL_CERT_FILE "${nix_env[@]}" \
            ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
@@ -659,12 +566,9 @@ do
     [[ -n "${!var:-}" ]] && env_args+=(--setenv "$var" "${!var}")
 done
 
-# ~/.config/nix/nix.conf is deliberately not bound: it routinely carries
-# access-tokens. Its other settings still matter — experimental-features being
-# the one that decides whether `nix build` runs at all — so the file is passed
-# through as NIX_CONFIG with the secret-bearing settings filtered out. Across
-# the switch it arrives pre-scrubbed in NIX_CONFIG, since the box user cannot
-# read ~/.config in the first place.
+# nix.conf often holds access-tokens, so it isn't bound; it's passed as
+# NIX_CONFIG with secret settings removed. In phase 2 NIX_CONFIG arrives
+# already scrubbed.
 if [[ $nix_ok -eq 1 ]]; then
     nix_config="${NIX_CONFIG:-}"
     if [[ $internal_switched -eq 0 && -r "$HOME/.config/nix/nix.conf" ]]; then
@@ -683,9 +587,7 @@ fi
 
 # ----------------------------------------------------------- sandbox launch --
 
-# The whole reason for the user switch, so verify it rather than assume it: the
-# daemon reports whether it trusts this connection. Best-effort — an old nix, or
-# one without the nix-command feature, simply does not answer.
+# Verify the daemon doesn't trust us. Best-effort: older nix may not answer.
 if [[ $nix_ok -eq 1 ]] && command -v nix >/dev/null 2>&1; then
     trusted="$(nix store info --json --extra-experimental-features nix-command \
                  2>/dev/null | tr -d '[:space:]' | grep -o '"trusted":[a-z0-9]*' || true)"
@@ -699,8 +601,8 @@ bwrap_args=(
     "${nix_args[@]}"
     --proc /proc
     --dev /dev
-    --tmpfs "$HOME"          # must precede binds under $HOME or it wipes them
-    "${profile_args[@]}"     # ...so the profile symlinks are recreated here
+    --tmpfs "$HOME"          # before any bind under $HOME
+    "${profile_args[@]}"
     --tmpfs /tmp
     --tmpfs /var/tmp
     "$project_mode" "$(src_of "$project")" "$project"
@@ -717,11 +619,8 @@ bwrap_args=(
     "${env_args[@]}"
 )
 
-# Note: --unshare-user is deliberately omitted. bwrap already creates a user
-# namespace, and forcing another breaks the nested bwrap that Claude Code's own
-# Bash sandbox relies on. --new-session is likewise omitted: it would cost the
-# controlling TTY the interactive UI needs, and dev.tty.legacy_tiocsti is 0 on
-# modern kernels, so TIOCSTI injection is already blocked.
+# No --unshare-user: breaks Claude Code's nested bwrap. No --new-session: the
+# UI needs the controlling TTY, and TIOCSTI is off on modern kernels anyway.
 [[ $offline -eq 1 ]] && bwrap_args+=(--unshare-net)
 
 if [[ $dry_run -eq 1 ]]; then

@@ -1,28 +1,22 @@
 #!/usr/bin/env bash
 #
-# agent-box-mount — the one part of agent-box that runs as root, via sudo.
+# agent-box-mount: the part of agent-box that runs as root, via sudo.
 #
 # Usage: sudo agent-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]
 #
-# In a private mount namespace, exposes each PATH through an idmapped bind
-# mount on which the invoking user's uid and primary gid read as the box
-# user's, then drops to the box user and runs COMMAND there. The box works on
-# the files as itself, and whatever it creates lands on disk owned by the
-# invoking user — no ACLs, and nothing to chown back afterwards.
+# In a private mount namespace, idmap-mounts each PATH so the invoking user's
+# uid/gid read as the box user's, then runs COMMAND as the box user. Files it
+# creates land on disk owned by the invoking user.
 #
-# Small and fixed on purpose: the sudoers rule names this file, so what it
-# accepts is what the invoking user can do as root. Hence:
-#   - The box user is set here and nowhere else; it is not an argument.
-#   - Only the invoker's own uid/gid are mapped. Anything else under a mount
-#     reads as nobody, with the same "other" access the box would have anyway.
-#   - Ownership is checked on what actually got mounted, not on the name, so a
-#     symlink swapped in between check and mount cannot redirect it.
-#   - The mounts live in a namespace only COMMAND and its children can see.
+# The sudoers rule names this file, so it stays small and strict:
+#   - The box user is a constant, not an argument.
+#   - Only the invoker's uid/gid are mapped; anything else reads as nobody.
+#   - Ownership is checked on the mounted inode, not the name.
+#   - Mounts are visible only in COMMAND's namespace.
 
 set -euo pipefail
 
-# The unprivileged user the sandbox runs as — the single place it is set.
-# It must not be in nix.conf's trusted-users; agent-box asserts that inside.
+# Must not be in nix.conf's trusted-users; agent-box checks.
 box_user=agents
 
 PATH=/run/current-system/sw/bin:/usr/bin:/bin   # pinned by the flake
@@ -55,19 +49,18 @@ done
 [[ $# -ge 2 ]] || die "usage: agent-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]"
 shift
 
-# Into a private mount namespace first, so nothing below is visible on the host.
-# Decided by comparing namespaces rather than by a marker a caller could set.
+# Enter a private mount namespace. Detected by comparing namespaces, not by a
+# marker a caller could set.
 if [[ "$(readlink /proc/self/ns/mnt)" == "$(readlink /proc/1/ns/mnt)" ]]; then
     exec unshare --mount --propagation private -- "$BASH" "$0" "${orig_args[@]}"
 fi
 
-# Somewhere the box user can reach without traversing the invoker's 0700 $HOME.
+# Reachable by the box user without traversing the invoker's $HOME.
 mkdir -p "$stage"
 mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=64k agent-box "$stage"
 
-# On-disk id first, the id it reads as second — the reverse of what mount(8)
-# documents, verified empirically (util-linux 2.42, kernel 6.18). Both u and g
-# are needed: a uid-only map fails with EINVAL.
+# On-disk id first, mounted id second (reverse of mount(8)'s wording). A map
+# without g: fails with EINVAL.
 idmap="u:$host_uid:$box_uid:1 g:$host_gid:$box_gid:1"
 for i in "${!paths[@]}"; do
     src="${paths[$i]}"
@@ -75,8 +68,7 @@ for i in "${!paths[@]}"; do
     if [[ -d $src ]]; then mkdir "$dst"; else : > "$dst"; fi
     mount --bind -o "X-mount.idmap=$idmap" "$src" "$dst" \
         || die "could not idmap-mount $src (its error is above)"
-    # Only the invoker's uid is mapped, so this reads as the box user exactly
-    # when the mounted inode is the invoker's.
+    # Reads as box_uid only if the mounted inode is the invoker's.
     seen="$(stat -c %u "$dst")"
     if [[ "$seen" != "$box_uid" ]]; then
         umount "$dst"
@@ -87,9 +79,8 @@ for i in "${!paths[@]}"; do
     fi
 done
 
-# no_new_privs from here on, so nothing the box user runs — before bwrap, which
-# sets it too, or outside it — can regain privileges through a setuid binary
-# such as sudo. Unprivileged user namespaces, which bwrap uses, still work.
+# no_new_privs: no regaining privileges through setuid binaries. bwrap's user
+# namespaces still work.
 exec setpriv --reuid="$box_uid" --regid="$box_gid" --init-groups --no-new-privs -- \
     env -i HOME="$box_home" USER="$box_user" LOGNAME="$box_user" \
            PATH="$PATH" AGENT_BOX_STAGE="$stage" "$@"
