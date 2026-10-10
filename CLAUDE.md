@@ -25,10 +25,15 @@
 * A read-only bind mount does not stop `connect()` on a unix socket: the EROFS
   check in `sb_permission` covers reg/dir/lnk only. Hiding a socket means
   removing the path, not binding it ro.
-* `chmod` on an ACL-bearing path rewrites the ACL mask and can silently revoke a
-  named-user entry — hence state-dir chmods happen at creation only.
 * The sudo switch can't be tested from the agent sandbox: bwrap sets
   NO_NEW_PRIVS, so setuid sudo refuses ("no new privileges flag is set").
-* `setfacl -m u:<uid>` fails with EINVAL if that uid is not mapped into the
-  current user namespace — so the agent sandbox (which maps only one uid) cannot
-  apply or test ACLs for the box user, though generating them works.
+* claude-box-mount (idmapped mounts) needs real root: untestable from the agent
+  sandbox. Phase 2 can be simulated by hand-binding paths to $CLAUDE_BOX_STAGE/N.
+* The agent sandbox runs as `agents`, so `nix eval .` fails ("repository path
+  ... is not owned by current user"); `nix eval "path:$PWD#..."` works but
+  rewrote flake.lock with a newer nixpkgs — `git checkout flake.lock` after.
+* This repo is shared with the agent sandbox via ACLs; `chmod` on a file resets
+  its ACL mask and locks the agent out (happened to claude-box-mount). Fix:
+  `setfacl -m m::rwx FILE`.
+* `X-mount.idmap=u:A:B:1` maps on-disk A to B as seen on the mount — reverse of
+  the mount(8) wording. A map without a `g:` part fails with EINVAL.

@@ -30,11 +30,8 @@
         bashInteractive coreutils findutils gnugrep gnused gawk
         diffutils patch less which procps
 
-        # setfacl/getfacl: how the box user is granted the paths it needs
-        # (claude-box only ever prints those commands, or runs them under
-        # --setfacl). sudo is deliberately absent: the privilege drop needs the
-        # host's setuid one, which a store copy could never be.
-        acl
+        # sudo is deliberately absent: the privilege drop needs the host's
+        # setuid one, which a store copy could never be.
 
         # version control and search
         git gh ripgrep fd jq tree
@@ -60,7 +57,14 @@
           installPhase = ''
             runHook preInstall
             install -Dm755 claude-box $out/bin/claude-box
-            patchShebangs $out/bin/claude-box
+            install -Dm755 claude-box-mount $out/bin/claude-box-mount
+            patchShebangs $out/bin/claude-box $out/bin/claude-box-mount
+            # The helper runs as root, so its PATH is fixed to store paths rather
+            # than whatever the host has. Not wrapped: the sudoers rule should
+            # name the script itself, not a wrapper around it.
+            substituteInPlace $out/bin/claude-box-mount \
+              --replace-fail 'PATH=/run/current-system/sw/bin:/usr/bin:/bin' \
+                             'PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.getent ]}'
             # bwrap is pinned ahead of the host's: the sandbox depends on its
             # exact flag behaviour. Everything else is a fallback.
             # CLAUDE_BOX_SELF is the wrapper's own path. The privilege drop
@@ -72,6 +76,7 @@
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
               --suffix PATH : ${pkgs.lib.makeBinPath (toolchain pkgs)} \
               --set CLAUDE_BOX_SELF $out/bin/claude-box \
+              --set CLAUDE_BOX_MOUNT $out/bin/claude-box-mount \
               --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             runHook postInstall
           '';

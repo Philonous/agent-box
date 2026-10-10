@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# claude-box-mount — the one part of claude-box that runs as root, via sudo.
+#
+# Usage: sudo claude-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]
+#
+# In a private mount namespace, exposes each PATH through an idmapped bind
+# mount on which the invoking user's uid and primary gid read as the box
+# user's, then drops to the box user and runs COMMAND there. The box works on
+# the files as itself, and whatever it creates lands on disk owned by the
+# invoking user — no ACLs, and nothing to chown back afterwards.
+#
+# Small and fixed on purpose: the sudoers rule names this file, so what it
+# accepts is what the invoking user can do as root. Hence:
+#   - The box user is set here and nowhere else; it is not an argument.
+#   - Only the invoker's own uid/gid are mapped. Anything else under a mount
+#     reads as nobody, with the same "other" access the box would have anyway.
+#   - Ownership is checked on what actually got mounted, not on the name, so a
+#     symlink swapped in between check and mount cannot redirect it.
+#   - The mounts live in a namespace only COMMAND and its children can see.
+
+set -euo pipefail
+
+# The unprivileged user the sandbox runs as — the single place it is set.
+# It must not be in nix.conf's trusted-users; claude-box asserts that inside.
+box_user=agents
+
+PATH=/run/current-system/sw/bin:/usr/bin:/bin   # pinned by the flake
+stage=/run/claude-box
+
+die() { printf 'claude-box-mount: %s\n' "$*" >&2; exit 1; }
+
+[[ $(id -u) -eq 0 ]] || die "must be run as root, through sudo"
+host_uid="${SUDO_UID:-}"
+host_gid="${SUDO_GID:-}"
+[[ $host_uid =~ ^[0-9]+$ && $host_gid =~ ^[0-9]+$ ]] \
+    || die "SUDO_UID/SUDO_GID are missing — run it through sudo"
+[[ $host_uid -ne 0 ]] || die "run it as the user whose files are shared, not as root"
+
+box_uid="$(id -u "$box_user" 2>/dev/null)" || die "user '$box_user' does not exist"
+box_gid="$(id -g "$box_user")"
+[[ $box_uid -ne 0 && $box_uid -ne $host_uid ]] \
+    || die "'$box_user' must be a separate, unprivileged user"
+box_home="$(getent passwd "$box_user" | cut -d: -f6)"
+
+orig_args=("$@")
+modes=()
+paths=()
+while [[ $# -gt 0 && $1 != -- ]]; do
+    [[ $# -ge 2 ]] || die "expected 'rw|ro PATH', got '$1'"
+    case "$1" in rw|ro) ;; *) die "expected rw or ro, got '$1'" ;; esac
+    [[ $2 == /* ]] || die "not an absolute path: $2"
+    modes+=("$1"); paths+=("$2"); shift 2
+done
+[[ $# -ge 2 ]] || die "usage: claude-box-mount [rw|ro PATH]... -- COMMAND [ARGS...]"
+shift
+
+# Into a private mount namespace first, so nothing below is visible on the host.
+# Decided by comparing namespaces rather than by a marker a caller could set.
+if [[ "$(readlink /proc/self/ns/mnt)" == "$(readlink /proc/1/ns/mnt)" ]]; then
+    exec unshare --mount --propagation private -- "$BASH" "$0" "${orig_args[@]}"
+fi
+
+# Somewhere the box user can reach without traversing the invoker's 0700 $HOME.
+mkdir -p "$stage"
+mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=64k claude-box "$stage"
+
+# On-disk id first, the id it reads as second — the reverse of what mount(8)
+# documents, verified empirically (util-linux 2.42, kernel 6.18). Both u and g
+# are needed: a uid-only map fails with EINVAL.
+idmap="u:$host_uid:$box_uid:1 g:$host_gid:$box_gid:1"
+for i in "${!paths[@]}"; do
+    src="${paths[$i]}"
+    dst="$stage/$i"
+    if [[ -d $src ]]; then mkdir "$dst"; else : > "$dst"; fi
+    mount --bind -o "X-mount.idmap=$idmap" "$src" "$dst" \
+        || die "could not idmap-mount $src (its error is above)"
+    # Only the invoker's uid is mapped, so this reads as the box user exactly
+    # when the mounted inode is the invoker's.
+    seen="$(stat -c %u "$dst")"
+    if [[ "$seen" != "$box_uid" ]]; then
+        umount "$dst"
+        die "$src is not owned by uid $host_uid (on the idmapped mount it reads as uid $seen, expected $box_uid)"
+    fi
+    if [[ ${modes[$i]} == ro ]]; then
+        mount -o remount,bind,ro "$dst"
+    fi
+done
+
+# no_new_privs from here on, so nothing the box user runs — before bwrap, which
+# sets it too, or outside it — can regain privileges through a setuid binary
+# such as sudo. Unprivileged user namespaces, which bwrap uses, still work.
+exec setpriv --reuid="$box_uid" --regid="$box_gid" --init-groups --no-new-privs -- \
+    env -i HOME="$box_home" USER="$box_user" LOGNAME="$box_user" \
+           PATH="$PATH" CLAUDE_BOX_STAGE="$stage" "$@"

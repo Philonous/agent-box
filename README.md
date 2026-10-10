@@ -60,7 +60,6 @@ older `claude-box -- -p '...'` form now tells you to write
 | `--ro-bind PATH` | Additionally bind `PATH` read-only (repeatable) |
 | `--env VAR` | Pass one more environment variable through the scrub (repeatable) |
 | `--new` | Start a fresh conversation instead of passing `--continue` to the default `claude` |
-| `--setfacl` | Apply the ACLs claude-box would otherwise only print, then start. Never done without this flag |
 | `--dry-run` | Print the command that would run and exit (at the user switch, which is runnable as printed) |
 
 Everything after `--` is the command line to run, verbatim.
@@ -72,7 +71,7 @@ Everything after `--` is the command line to run, verbatim.
 | **Filesystem** | `$HOME` is a tmpfs. Only the project directory is bound read-write. `/nix/store` and `/etc` are read-only. `/tmp` and `/var/tmp` are tmpfs. |
 | **Processes** | Private PID namespace — Claude sees ~5 processes instead of your full table, and cannot signal anything on the host. |
 | **IPC / UTS / cgroup** | Separate namespaces; hostname reads as `claude-box`. |
-| **User** | A separate unprivileged user (default `agents`), so your own files are unreachable by permissions and the Nix daemon sees an untrusted client. |
+| **User** | A separate unprivileged user (`agents`, set in `claude-box-mount`), so your own files are unreachable by permissions and the Nix daemon sees an untrusted client. Files it creates are still owned by you (see below). |
 | **Capabilities** | All dropped, plus `no_new_privs` — the setuid binaries under `/run/wrappers` cannot elevate inside. |
 | **Environment** | `--clearenv`, then only locale/terminal and `ANTHROPIC_*` variables are re-set, so stray `AWS_*` / `GITHUB_TOKEN` values in your shell do not leak in. |
 | **Lifetime** | `--die-with-parent`: the sandbox dies with the launcher. |
@@ -82,9 +81,11 @@ the empty path chain `~/projects/foo/`, not `foo`'s other children.
 
 ## Running as a separate user
 
-The sandbox does not run as you. On startup `claude-box` re-execs itself through
-`sudo` as an unprivileged user — `agents` by default, override with
-`CLAUDE_BOX_USER` — and only then builds the sandbox.
+The sandbox does not run as you. On startup `claude-box` re-execs itself
+through `sudo claude-box-mount`, a small fixed helper that drops to an
+unprivileged user, and only then builds the sandbox. The user is `agents`; to
+change it, edit the `box_user=` line in `claude-box-mount` — that line is the
+only place it is set.
 
 The reason is the Nix daemon. It decides whether a client is trusted from the
 peer's uid (`SO_PEERCRED`), and a user namespace cannot change what the kernel
@@ -103,8 +104,11 @@ nix store info --json          # inside the box: {"trusted":false,...}
 The privilege drop is always printed before it runs, in full:
 
 ```
-claude-box: switching to agents — the Nix daemon decides client trust by uid
-claude-box: + sudo -u agents -- /nix/store/...-claude-box/bin/claude-box \
+claude-box: switching to the box user — the Nix daemon decides client trust by uid
+claude-box: + sudo -- /nix/store/...-claude-box/bin/claude-box-mount \
+    rw /home/you/src/foo rw /home/you/.local/state/claude-box/home%you%src%foo-123 \
+    rw /home/you/.claude/.credentials.json \
+    -- /nix/store/...-claude-box/bin/claude-box \
     --internal-switched --internal-user you --internal-home /home/you \
     --internal-handoff /tmp/claude-box-handoff.Ab3kR9
 ```
@@ -117,49 +121,63 @@ resets that unless the sudoers rule says `SETENV`. It is world-readable and
 contains no secrets, by design: `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`
 are *not* carried across, and claude-box says so when they are set.
 
-### Granting access with ACLs
+### File ownership: idmapped mounts
 
-The box user cannot read your project, since `~/projects` is typically `0700`.
-`claude-box` checks what it can actually reach, and when something is missing it
-prints the `setfacl` commands that would grant it and exits — it never changes
-an ACL on its own:
+The box user cannot normally read your project (`~/projects` is typically
+`0700`), and anything it wrote would be owned by it. `claude-box-mount` solves
+both with [idmapped mounts](https://docs.kernel.org/filesystems/idmappings.html).
+In a private mount namespace, it bind-mounts each path it is given under
+`/run/claude-box/N`, mapped so that your uid and primary gid read as the box
+user's. Then it drops to the box user. bwrap binds those copies back to their
+real paths inside the sandbox.
 
-```
-claude-box: running as agents (uid 990), which cannot reach:
-  /home/you/src/foo (directory, read-write)
+The effect:
 
-Run these as the owner of those paths:
+- Inside, the project reads as the box user's own, so permissions just work.
+- Whatever the box creates lands on disk as **you** (`you:users`), so there is
+  nothing to chown back and no ACLs to manage.
+- Your `0700` ancestors stay `0700`. The staged copies are reached through
+  `/run/claude-box`, not through your `$HOME`.
+- The mounts exist only in that namespace. Outside the box, the user `agents`
+  still cannot reach any of your files.
 
-  setfacl -m u:agents:x /home/you/src
-  setfacl -R -m u:agents:rwX -m d:u:agents:rwX -m d:u:you:rwX /home/you/src/foo
+`claude-box-mount` is the only part that runs as root, so it is deliberately
+small and strict:
 
-...or re-run claude-box with --setfacl to apply them before starting.
-```
+- The box user is a constant in the script, not an argument.
+- Only your own uid and primary gid are mapped. Anything else under a shared
+  path (a root-owned file, a file with another group) reads as `nobody` there.
+  The box gets the same "other" access to it as it would have anyway.
+- Each path must be owned by you. This is checked on what actually got
+  mounted, so a symlink swapped in at the last moment cannot redirect it to
+  someone else's files.
+- `ro` paths are remounted read-only on top of bwrap's own `--ro-bind`.
+- It drops to the box user with `no_new_privs` set, so even before bwrap
+  starts nothing can regain privileges through a setuid binary.
 
-Three things worth knowing about those commands:
+A `--bind`/`--ro-bind` path you don't own (a system file, say) is not idmapped.
+It is bound as it is, and the box user has to be able to reach it on its own
+permissions; `claude-box` says so if it can't.
 
-- **Ancestors need `x` of their own.** A recursive ACL on the project is not
-  enough if `~/src` is `0700`: without traversal nothing beneath it can be
-  reached. Every blocking ancestor gets its own entry.
-- **The default entries cut both ways.** Files the box creates are owned by
-  `agents`, so `d:u:you:rwX` is what keeps them editable in place by you
-  afterwards; `d:u:agents:rwX` does the same for files you add later.
-- **They are generous on purpose.** Covering a path that is already reachable
-  costs nothing, and one short list is easier to audit than a minimal one.
+The binds are not recursive: a filesystem mounted *inside* the project
+directory does not appear in the box.
 
-The ACLs outlive the run, and they grant access to *anything* running as
-`agents`, not only to a sandboxed process. To revoke:
+This needs a filesystem that supports idmapped mounts: ext4, btrfs, xfs, tmpfs
+and overlayfs do, on any reasonably recent kernel.
+
+#### Migrating from the ACL setup
+
+Earlier versions granted access with ACLs, and files created back then are owned
+by `agents`. To clean up a project:
 
 ```sh
-setfacl -R -x u:agents -x d:u:agents ~/src/foo
-setfacl -x u:agents ~/src
+sudo chown -R --from=agents you:users ~/src/foo
+setfacl -R -x u:agents -x d:u:agents -x d:u:you ~/src/foo
 ```
 
-Never `setfacl -b`: that would also drop ACLs you set for your own reasons.
-
-One gotcha: `chmod` on a path that has an ACL rewrites its mask, which can
-silently revoke the box user's access. `claude-box` only ever chmods the state
-directory at creation time for that reason.
+Do the same for `~/.local/state/claude-box` and, if you shared it,
+`~/.claude/.credentials.json`. Then remove the `x` entries on ancestors such as
+`setfacl -x u:agents ~/src`.
 
 ## Per-project Claude state
 
@@ -180,17 +198,12 @@ Two details make this painless:
   the sandbox rotate the OAuth refresh token and silently invalidate your host
   login; sharing the one file keeps them in sync while exposing nothing else.
 
-Under the user switch, that shared credentials file is one of the paths the box
-user has to be able to read, so it appears in the `setfacl` list with a warning:
-the ACL hands your Claude credentials to anything running as `agents` until you
-revoke it. If you would rather not, delete `~/.claude/.credentials.json` from
-the ACL and sign in once inside the box instead — the login persists in the
-project's own state directory. Note that Claude Code rewriting that file can
-replace the inode and take the ACL with it, in which case claude-box simply
-prints the command again.
+That credentials file is shared through `claude-box-mount` like the project, so
+it is reachable only from inside the box's mount namespace, for as long as the
+box runs.
 
-Use `--share-claude` to opt out and use your real config directly. It needs an
-ACL on your real `~/.claude`, which is a much broader grant.
+Use `--share-claude` to opt out and use your real `~/.claude` and
+`~/.claude.json` directly, idmapped the same way. That is a much broader grant.
 
 ## Running it with Nix
 
@@ -301,9 +314,8 @@ These are real, and worth reading before relying on this.
 - **Not a privilege boundary.** It contains a misbehaving agent, not a kernel
   exploit. There is no seccomp filter. The separate uid adds real depth — your
   files are protected by permissions, not only by which paths are bound — but
-  the ACLs you grant are visible to *every* process running as that user, and a
-  `0755` `$HOME` still lets it read world-readable files that happen to be bound
-  in.
+  a `0755` `$HOME` still lets it read world-readable files that happen to be
+  bound in.
 
 ## Requirements
 
@@ -312,17 +324,30 @@ A kernel allowing unprivileged user namespaces (check
 user switch:
 
 - **The box user.** An unprivileged account that is *not* in `trusted-users`
-  (`nix.conf`) — `agents` by default, or set `CLAUDE_BOX_USER`. It needs no
-  home directory, shell or group of its own.
-- **A sudo rule** letting you run claude-box as that user, e.g.
-  `you ALL=(agents) NOPASSWD: /nix/store/...-claude-box/bin/claude-box` — or
-  nothing at all, and type your password at each start. `sudo` has to be the
-  host's setuid one, so it is deliberately not in the flake's toolchain.
-- **A filesystem with ACL support** for the project and state paths (ext4,
-  btrfs, xfs, zfs with `acltype=posixacl`). `setfacl` reporting
-  `Operation not supported` means the paths cannot be shared this way.
+  (`nix.conf`). It is `agents` unless you change `box_user=` in
+  `claude-box-mount`. It needs no home directory, shell or group of its own.
+- **A sudo rule** letting you run `claude-box-mount` as root, e.g.
+  `you ALL=(root) NOPASSWD: /nix/store/...-claude-box/bin/claude-box-mount` —
+  or no rule beyond plain sudo access, and type your password at each start.
+  On NixOS:
 
-Everything else — `bubblewrap`, `acl`, `python3` or `jq` for first-run config
-seeding, and the toolchain the sandbox sees — comes from the flake. Running the
-script directly rather than through Nix needs `bubblewrap` and `setfacl` on
-`PATH`.
+  ```nix
+  security.sudo.extraRules = [{
+    users = [ "you" ];
+    commands = [{
+      command = "${claude-box}/bin/claude-box-mount";
+      options = [ "NOPASSWD" ];
+    }];
+  }];
+  ```
+
+  `sudo` has to be the host's setuid one, so it is deliberately not in the
+  flake's toolchain.
+- **A filesystem with idmapped-mount support** for the project and state paths
+  (ext4, btrfs, xfs, tmpfs, overlayfs).
+
+Everything else — `bubblewrap`, `python3` or `jq` for first-run config seeding,
+and the toolchain the sandbox sees — comes from the flake, which also pins
+`claude-box-mount`'s `PATH` to store paths. Running the scripts directly rather
+than through Nix needs `bubblewrap` and util-linux (`mount`, `unshare`,
+`setpriv`) installed, with `claude-box-mount` next to `claude-box`.

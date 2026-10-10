@@ -16,15 +16,17 @@
 # without binding anything under the real $HOME. The Nix daemon socket is passed
 # through as well, so builds work inside; see --no-nix.
 #
-# The sandbox runs as a separate unprivileged user (default: agents). The Nix
-# daemon decides client trust from the peer's uid and a user namespace cannot
-# change that, so a sandbox running as a trusted user could set build-hook,
-# post-build-hook, extra-sandbox-paths or substituters on the daemon — which is
-# root-equivalent in practice. Running as an untrusted uid removes that, and the
-# invoking user's own files become unreachable by plain file permissions rather
-# than by bwrap's binds alone. The switch goes through sudo and is printed
-# before it runs; access to the few paths the box does need is granted with
-# POSIX ACLs, which claude-box checks but never changes on its own (--setfacl).
+# The sandbox runs as a separate unprivileged user (set in claude-box-mount).
+# The Nix daemon decides client trust from the peer's uid and a user namespace
+# cannot change that, so a sandbox running as a trusted user could set
+# build-hook, post-build-hook, extra-sandbox-paths or substituters on the
+# daemon — which is root-equivalent in practice. Running as an untrusted uid
+# removes that, and the invoking user's own files become unreachable by plain
+# file permissions rather than by bwrap's binds alone. The switch goes through
+# `sudo claude-box-mount` and is printed before it runs. That small fixed helper
+# gives the box the few paths it needs through idmapped mounts: the box sees
+# them as its own, and what it creates there lands on disk as the invoking
+# user's.
 
 set -euo pipefail
 
@@ -44,17 +46,11 @@ nix_daemon=1
 nix_ok=0
 dry_run=0
 new_session=0
-setfacl_apply=0
 extra_binds=()
 extra_rw=()
 extra_ro=()
 extra_env=()
 cmd=()
-
-# The unprivileged user the sandbox runs as. It must not be a trusted Nix user
-# (trusted-users in nix.conf), or the exercise is pointless — which is asserted
-# before launch rather than assumed.
-box_user="${CLAUDE_BOX_USER:-agents}"
 
 # Set by the re-exec; see "privilege drop". Undocumented on purpose: they are
 # this script talking to itself across sudo, not a user interface. The bulk
@@ -77,11 +73,10 @@ Runs a command confined to the project directory. The command defaults to
 `claude` if there is none yet); give another one to inspect or test the
 sandbox from inside.
 
-The sandbox runs as an unprivileged user (default: agents, override with
-CLAUDE_BOX_USER) so that its Nix daemon connection is untrusted. That user
-needs access to the project and to claude-box's state directory; when it
-lacks it, claude-box prints the setfacl commands that would grant it and
-exits without touching anything.
+The sandbox runs as an unprivileged user (set in claude-box-mount) so that
+its Nix daemon connection is untrusted. The switch goes through
+`sudo claude-box-mount`, which also hands the box the project and its state
+directory through idmapped mounts: files the box creates are owned by you.
 
 Options:
   -d, --dir PATH      Project root to confine to (default: current directory)
@@ -93,8 +88,6 @@ Options:
       --ro-bind PATH  Additionally bind PATH read-only (repeatable)
       --env VAR       Pass environment variable VAR through (repeatable)
       --new           Start a fresh conversation instead of --continue
-      --setfacl       Apply the ACLs claude-box would otherwise only print,
-                      then start. Never done without this flag.
       --dry-run       Print the command that would run, then exit
   -h, --help          Show this help
 
@@ -103,7 +96,6 @@ Use -- to separate the command from claude-box's own options.
 Examples:
   claude-box                                   # confine to $PWD, resume claude
   claude-box --new                             # ...or start a new conversation
-  claude-box --setfacl                         # grant the box user access first
   claude-box --ro-bind ~/.gitconfig            # let git commit work
   claude-box -d ~/src/foo -- claude -p 'hi'    # one-shot prompt
   claude-box bash                              # poke around inside the sandbox
@@ -120,21 +112,23 @@ while [[ $# -gt 0 ]]; do
         --offline)     offline=1; shift ;;
         --no-nix)      nix_daemon=0; shift ;;
         --share-claude) share_claude=1; shift ;;
+        # Resolved by phase 1 only; phase 2 gets them from the handoff, as
+        # the box user may not be able to resolve them at all.
         --bind)        [[ $# -ge 2 ]] || die "--bind needs an argument"
-                       # Resolved leniently: a path the box user cannot reach
-                       # yet should produce the ACL advice below, not a bare
-                       # realpath failure.
-                       bind_path="$(realpath -- "$2" 2>/dev/null || printf '%s' "$2")"
-                       extra_binds+=(--bind "$bind_path" "$bind_path")
-                       extra_rw+=("$bind_path"); shift 2 ;;
+                       if [[ $internal_switched -eq 0 ]]; then
+                           bind_path="$(realpath -e -- "$2")" || die "no such path: $2"
+                           extra_rw+=("$bind_path")
+                       fi
+                       shift 2 ;;
         --ro-bind)     [[ $# -ge 2 ]] || die "--ro-bind needs an argument"
-                       bind_path="$(realpath -- "$2" 2>/dev/null || printf '%s' "$2")"
-                       extra_binds+=(--ro-bind "$bind_path" "$bind_path")
-                       extra_ro+=("$bind_path"); shift 2 ;;
+                       if [[ $internal_switched -eq 0 ]]; then
+                           bind_path="$(realpath -e -- "$2")" || die "no such path: $2"
+                           extra_ro+=("$bind_path")
+                       fi
+                       shift 2 ;;
         --env)         [[ $# -ge 2 ]] || die "--env needs an argument"
                        extra_env+=("$2"); shift 2 ;;
         --new)         new_session=1; shift ;;
-        --setfacl)     setfacl_apply=1; shift ;;
         --dry-run)     dry_run=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         --internal-switched) internal_switched=1; shift ;;
@@ -184,18 +178,15 @@ if [[ $internal_switched -eq 1 ]]; then
         || die "handoff file is not owned by $internal_user: $internal_handoff"
 
     HOME="$internal_home"; export HOME
-    # The ACLs were applied (or not) before the switch; this side owns nothing.
-    setfacl_apply=0
 fi
-host_user="${internal_user:-$(id -un)}"
 
 # ---------------------------------------------------------------- preflight --
 
 command -v bwrap >/dev/null 2>&1 \
     || die "bubblewrap (bwrap) not found. On NixOS: nix-shell -p bubblewrap"
 
-# Phase 1 resolved and validated the project; re-resolving it as the box user
-# would fail on exactly the paths whose ACLs we are about to explain.
+# Phase 1 resolved and validated the project; the box user may not even be
+# able to stat its real path, only the idmapped copy.
 if [[ $internal_switched -eq 0 ]]; then
     [[ -d "$project" ]] || die "not a directory: $project"
     project="$(realpath -- "$project")"
@@ -220,9 +211,8 @@ compute_state_root() {
 }
 
 # Runs as the invoking user only: the box user has no business being able to
-# create directories under their $HOME. Note the chmods are creation-only —
-# chmod on an ACL-bearing path rewrites the ACL mask and would quietly revoke
-# the box user's access on every subsequent run.
+# create directories under their $HOME. It reaches the result through the
+# idmapped mount, where these 0700/0600 modes read as its own.
 ensure_state_root() {
     [[ -d "$state_root" ]] && return 0
 
@@ -263,139 +253,88 @@ PY
 
 # ------------------------------------------------------------------- access --
 
-# The host paths the sandbox has to reach once it is no longer running as the
-# invoking user. Directories and files are kept apart because the ACL for a tree
-# (-R, plus default entries for anything created in it later) is not the ACL for
-# a single file, and because the box user cannot stat what it cannot reach: the
-# classification is made on the invoking user's side and handed over.
-need_dir_rw=()
-need_file_rw=()
-need_dir_ro=()
-need_file_ro=()
+# The host paths the sandbox binds, as mode/path pairs. Those owned by the
+# invoking user — normally all of them — are handed to claude-box-mount, which
+# presents them idmapped so that the box works on them as their owner. Anything
+# else (a --ro-bind of a system file, say) is bound as it is and has to be
+# reachable by the box user on its own permissions.
+binds=()
+shares=()
 
-build_requirements() {
-    need_dir_rw=()
-    need_file_rw=()
-    need_dir_ro=()
-    need_file_ro=()
-    local p
+build_binds() {
+    binds=()
+    shares=()
+    local p i
 
     if [[ $project_mode == --ro-bind ]]; then
-        need_dir_ro+=("$project")
+        binds+=(ro "$project")
     else
-        need_dir_rw+=("$project")
+        binds+=(rw "$project")
     fi
 
     if [[ $share_claude -eq 1 ]]; then
-        need_dir_rw+=("$HOME/.claude")
-        [[ -f "$HOME/.claude.json" ]] && need_file_rw+=("$HOME/.claude.json")
+        binds+=(rw "$HOME/.claude")
+        [[ -f "$HOME/.claude.json" ]] && binds+=(rw "$HOME/.claude.json")
     else
-        need_dir_rw+=("$state_root")
+        binds+=(rw "$state_root")
         # Bound read-write into the sandbox so box and host keep the same OAuth
-        # refresh token (see the bind below); that needs the box user to reach it.
+        # refresh token (see the bind below).
         [[ -f "$HOME/.claude/.credentials.json" ]] \
-            && need_file_rw+=("$HOME/.claude/.credentials.json")
+            && binds+=(rw "$HOME/.claude/.credentials.json")
     fi
 
-    for p in "${extra_rw[@]}"; do
-        if [[ -f "$p" ]]; then need_file_rw+=("$p"); else need_dir_rw+=("$p"); fi
-    done
-    for p in "${extra_ro[@]}"; do
-        if [[ -f "$p" ]]; then need_file_ro+=("$p"); else need_dir_ro+=("$p"); fi
+    for p in "${extra_rw[@]}"; do binds+=(rw "$p"); done
+    for p in "${extra_ro[@]}"; do binds+=(ro "$p"); done
+
+    for ((i = 0; i < ${#binds[@]}; i += 2)); do
+        p="${binds[i+1]}"
+        [[ -e "$p" ]] || die "no such file or directory: $p"
+        [[ "$(stat -c %u -- "$p")" == "$(id -u)" ]] && shares+=("${binds[i]}" "$p")
     done
     return 0
 }
 
-acl_cmd() {
-    local opts="$1"; shift
-    printf 'setfacl %s' "$opts"
-    printf ' %q' "$@"
-}
+# Phase 2: where each host path is bound from. claude-box-mount stages the
+# shares, in the order given, as $CLAUDE_BOX_STAGE/0, /1, ...
+declare -A bind_src=()
 
-# The setfacl commands that would grant the box user what it needs. Deliberately
-# generous: covering a path that is already reachable costs nothing, and a short
-# list is easier to read — and to audit — than a minimal one.
-acl_commands=()
-
-build_acl_commands() {
-    acl_commands=()
-    local -a anc=()
-    local -A seen=()
-    local p d mode
-
-    # Traversal. A directory that is already world-traversable needs no entry;
-    # one that is not (0700 is the stock mode for ~/.local and friends) needs x,
-    # or nothing beneath it can be reached at all. An ancestor this user cannot
-    # stat at all is listed too — generous beats silently incomplete.
-    for p in "${need_dir_rw[@]}" "${need_file_rw[@]}" \
-             "${need_dir_ro[@]}" "${need_file_ro[@]}"; do
-        d="$(dirname -- "$p")"
-        while [[ -n "$d" && "$d" != / ]]; do
-            if [[ -z "${seen[$d]:-}" ]]; then
-                seen[$d]=1
-                mode="$(stat -c %a -- "$d" 2>/dev/null || true)"
-                [[ -n "$mode" ]] && (( 8#$mode & 1 )) || anc+=("$d")
-            fi
-            d="$(dirname -- "$d")"
+resolve_sources() {
+    local i
+    if [[ ${#shares[@]} -gt 0 ]]; then
+        [[ -n "${CLAUDE_BOX_STAGE:-}" ]] \
+            || die "CLAUDE_BOX_STAGE is not set — phase 2 must be started by claude-box-mount"
+        for ((i = 0; i < ${#shares[@]}; i += 2)); do
+            bind_src[${shares[i+1]}]="$CLAUDE_BOX_STAGE/$((i / 2))"
         done
-    done
-
-    [[ ${#anc[@]} -gt 0 ]] \
-        && acl_commands+=("$(acl_cmd "-m u:$box_user:x" "${anc[@]}")")
-    # The default entries matter in both directions: files the box creates are
-    # owned by the box user, so without d:u:$host_user the invoking user could
-    # read and delete them but not edit them in place.
-    [[ ${#need_dir_rw[@]} -gt 0 ]] \
-        && acl_commands+=("$(acl_cmd \
-            "-R -m u:$box_user:rwX -m d:u:$box_user:rwX -m d:u:$host_user:rwX" \
-            "${need_dir_rw[@]}")")
-    [[ ${#need_dir_ro[@]} -gt 0 ]] \
-        && acl_commands+=("$(acl_cmd "-R -m u:$box_user:rX" "${need_dir_ro[@]}")")
-    [[ ${#need_file_rw[@]} -gt 0 ]] \
-        && acl_commands+=("$(acl_cmd "-m u:$box_user:rw" "${need_file_rw[@]}")")
-    [[ ${#need_file_ro[@]} -gt 0 ]] \
-        && acl_commands+=("$(acl_cmd "-m u:$box_user:r" "${need_file_ro[@]}")")
-    return 0
+    fi
 }
 
-# Run as the box user, so the kernel — which knows about ACLs, masks and
-# inherited defaults — is the one answering, not a reimplementation of it.
+src_of() { printf '%s' "${bind_src[$1]:-$1}"; }
+
+# Run as the box user, so the kernel is the one answering.
 check_access() {
     local -a bad=()
-    local p
+    local i mode p src
 
-    for p in "${need_dir_rw[@]}"; do
-        [[ -r "$p" && -w "$p" && -x "$p" ]] || bad+=("$p (directory, read-write)")
-    done
-    for p in "${need_file_rw[@]}"; do
-        [[ -r "$p" && -w "$p" ]] || bad+=("$p (file, read-write)")
-    done
-    for p in "${need_dir_ro[@]}"; do
-        [[ -r "$p" && -x "$p" ]] || bad+=("$p (directory, read-only)")
-    done
-    for p in "${need_file_ro[@]}"; do
-        [[ -r "$p" ]] || bad+=("$p (file, read-only)")
+    for ((i = 0; i < ${#binds[@]}; i += 2)); do
+        mode="${binds[i]}"
+        p="${binds[i+1]}"
+        src="$(src_of "$p")"
+        if [[ -d "$src" ]]; then
+            [[ -r "$src" && -x "$src" ]] || bad+=("$p")
+        else
+            [[ -r "$src" ]] || bad+=("$p")
+        fi
+        [[ $mode == ro || -w "$src" ]] || bad+=("$p (read-write)")
     done
     [[ ${#bad[@]} -eq 0 ]] && return 0
-
-    build_acl_commands
 
     {
         printf 'claude-box: running as %s (uid %s), which cannot reach:\n' \
             "$(id -un)" "$(id -u)"
         printf '  %s\n' "${bad[@]}"
-        printf '\nRun these as the owner of those paths:\n\n'
-        printf '  %s\n' "${acl_commands[@]}"
-        printf '\n...or re-run claude-box with --setfacl to apply them before starting.\n'
-        for p in "${need_file_rw[@]}" "${need_dir_rw[@]}"; do
-            case "$p" in
-                */.claude|*/.claude.json|*/.credentials.json)
-                    printf '\nNote: that grants %s your Claude credentials for as long as the\n' "$box_user"
-                    printf 'ACL stands. Undo with: setfacl -R -x u:%s -x d:u:%s PATH\n' \
-                        "$box_user" "$box_user"
-                    break ;;
-            esac
-        done
+        printf '\nPaths you own are idmapped and always reachable; these are not yours,\n'
+        printf 'so the box user needs access to them on its own permissions.\n'
     } >&2
     exit 1
 }
@@ -404,7 +343,7 @@ check_access() {
 
 # Now that everything it sets has been declared, read what phase 1 worked out:
 # the project, the state directory, the host $PATH, the resolved profile links,
-# the environment worth carrying, and the requirement lists.
+# the environment worth carrying, and the bind lists.
 if [[ $internal_switched -eq 1 ]]; then
     # shellcheck source=/dev/null
     . "$internal_handoff"
@@ -416,37 +355,29 @@ fi
 
 # Phase 1, still the invoking user: do everything that has to be done as them —
 # resolving symlink chains through 0700 directories, creating and seeding the
-# state directory, applying ACLs — then re-exec as the box user. Phase 2 is this
-# same script with --internal-switched, and is where the sandbox gets built.
+# state directory, deciding what gets bound — then re-exec as the box user
+# through claude-box-mount. Phase 2 is this same script with
+# --internal-switched, and is where the sandbox gets built.
 #
 # The switch must happen out here: inside bwrap all capabilities are dropped,
 # and bwrap's --uid only relabels the uid within its own namespace, which is not
 # what the Nix daemon sees over SO_PEERCRED.
-if [[ $internal_switched -eq 0 && "$(id -un)" != "$box_user" ]]; then
-    id -u "$box_user" >/dev/null 2>&1 \
-        || die "user '$box_user' does not exist (create it, or set CLAUDE_BOX_USER)"
+if [[ $internal_switched -eq 0 ]]; then
     command -v sudo >/dev/null 2>&1 \
-        || die "sudo not found — it is how claude-box drops to '$box_user'"
+        || die "sudo not found — it is how claude-box drops to the box user"
+
+    # The wrapper, not the wrapped script: it is what puts bubblewrap and the
+    # toolchain back on $PATH after the environment has been reset.
+    self="${CLAUDE_BOX_SELF:-$(realpath -- "$0")}"
+    mount_helper="${CLAUDE_BOX_MOUNT:-$(dirname -- "$self")/claude-box-mount}"
+    [[ -x "$mount_helper" ]] || die "claude-box-mount not found at $mount_helper"
 
     if [[ $share_claude -eq 0 ]]; then
         compute_state_root
         ensure_state_root
     fi
 
-    build_requirements
-    build_acl_commands
-
-    # Only ever on request. These ACLs outlive the run, so granting them is the
-    # user's call to make, not a side effect of starting a sandbox.
-    if [[ $setfacl_apply -eq 1 ]]; then
-        command -v setfacl >/dev/null 2>&1 \
-            || die "setfacl not found (nixpkgs: acl)"
-        for acl in "${acl_commands[@]}"; do
-            note "+ $acl"
-            eval "$acl" \
-                || die "that setfacl failed (its own error is above); the paths' filesystem may not support ACLs"
-        done
-    fi
+    build_binds
 
     # The handoff. Everything phase 2 needs to rebuild what was worked out here,
     # kept out of argv so the printed sudo line stays readable — and out of the
@@ -459,8 +390,7 @@ if [[ $internal_switched -eq 0 && "$(id -un)" != "$box_user" ]]; then
     trap 'rm -f -- "$handoff"' EXIT INT TERM
     chmod 644 -- "$handoff"
     {
-        printf '# claude-box: handed to %s for this run; safe to delete.\n' "$box_user"
-        printf 'box_user=%q\n' "$box_user"
+        printf '# claude-box: handed to the box user for this run; safe to delete.\n'
         printf 'project=%q\n' "$project"
         printf 'project_mode=%q\n' "$project_mode"
         printf 'state_root=%q\n' "$state_root"
@@ -489,28 +419,27 @@ if [[ $internal_switched -eq 0 && "$(id -un)" != "$box_user" ]]; then
         do
             [[ -n "${!var:-}" ]] && printf 'internal_env+=(%q)\n' "$var=${!var}"
         done
-        # The requirement lists, classified here while they are all reachable.
-        for pathspec in "${need_dir_rw[@]}"; do printf 'need_dir_rw+=(%q)\n' "$pathspec"; done
-        for pathspec in "${need_file_rw[@]}"; do printf 'need_file_rw+=(%q)\n' "$pathspec"; done
-        for pathspec in "${need_dir_ro[@]}"; do printf 'need_dir_ro+=(%q)\n' "$pathspec"; done
-        for pathspec in "${need_file_ro[@]}"; do printf 'need_file_ro+=(%q)\n' "$pathspec"; done
+        # The bind lists, classified here while they are all reachable. The
+        # shares must stay in the order claude-box-mount is given them.
+        for pathspec in "${extra_rw[@]}"; do printf 'extra_rw+=(%q)\n' "$pathspec"; done
+        for pathspec in "${extra_ro[@]}"; do printf 'extra_ro+=(%q)\n' "$pathspec"; done
+        for pathspec in "${binds[@]}"; do printf 'binds+=(%q)\n' "$pathspec"; done
+        for pathspec in "${shares[@]}"; do printf 'shares+=(%q)\n' "$pathspec"; done
     } > "$handoff"
 
     for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN "${extra_env[@]}"; do
         [[ -n "${!var:-}" ]] \
-            && note "$var is not carried across the switch to $box_user; the box uses its own login"
+            && note "$var is not carried across the switch to the box user; the box uses its own login"
     done
 
-    # The wrapper, not the wrapped script: it is what puts bubblewrap and the
-    # toolchain back on $PATH after sudo has reset the environment.
-    self="${CLAUDE_BOX_SELF:-$(realpath -- "$0")}"
-    sudo_cmd=(sudo -u "$box_user" -- "$self" --internal-switched
+    sudo_cmd=(sudo -- "$mount_helper" "${shares[@]}" --
+              "$self" --internal-switched
               --internal-user "$(id -un)"
               --internal-home "$HOME"
               --internal-handoff "$handoff"
               "${orig_args[@]}")
 
-    note "switching to $box_user — the Nix daemon decides client trust by uid"
+    note "Switching to box user"
     { printf 'claude-box: +'; printf ' %q' "${sudo_cmd[@]}"; printf '\n'; } >&2
 
     # A dry run stops at the switch rather than asking for a password: the line
@@ -528,16 +457,9 @@ if [[ $internal_switched -eq 0 && "$(id -un)" != "$box_user" ]]; then
     exit $rc
 fi
 
-# Either phase 2, or a run that was the box user to begin with.
-if [[ $internal_switched -eq 0 ]]; then
-    [[ $share_claude -eq 1 ]] || { compute_state_root; ensure_state_root; }
-    build_requirements
-fi
-
+# Phase 2, as the box user, inside claude-box-mount's mount namespace.
+resolve_sources
 check_access
-
-[[ $share_claude -eq 1 || -d "$state_root" ]] \
-    || die "state directory is missing: $state_root"
 
 # ------------------------------------------------------- nix path discovery --
 
@@ -616,22 +538,34 @@ nix_args+=(--ro-bind /etc /etc)
 
 state_args=()
 
+# Paths come from the bind list rather than from probing the host: the box user
+# cannot see the real ones, only their idmapped copies.
+has_bind() {
+    local i
+    for ((i = 1; i < ${#binds[@]}; i += 2)); do
+        [[ "${binds[i]}" == "$1" ]] && return 0
+    done
+    return 1
+}
+
 if [[ $share_claude -eq 1 ]]; then
-    state_args+=(--bind "$HOME/.claude" "$HOME/.claude")
-    [[ -f "$HOME/.claude.json" ]] \
-        && state_args+=(--bind "$HOME/.claude.json" "$HOME/.claude.json")
+    state_args+=(--bind "$(src_of "$HOME/.claude")" "$HOME/.claude")
+    has_bind "$HOME/.claude.json" \
+        && state_args+=(--bind "$(src_of "$HOME/.claude.json")" "$HOME/.claude.json")
 else
-    state_args+=(--bind "$state_root/claude" "$HOME/.claude")
-    state_args+=(--bind "$state_root/claude.json" "$HOME/.claude.json")
+    state_src="$(src_of "$state_root")"
+    state_args+=(--bind "$state_src/claude" "$HOME/.claude")
+    state_args+=(--bind "$state_src/claude.json" "$HOME/.claude.json")
 
     # Share only the credentials file, read-write. Copying it instead would let
     # the sandbox rotate the OAuth refresh token and silently invalidate the
     # host's login; a shared bind of this one file keeps them in sync.
-    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
-        state_args+=(--bind "$HOME/.claude/.credentials.json" \
-                            "$HOME/.claude/.credentials.json")
-    fi
+    creds="$HOME/.claude/.credentials.json"
+    has_bind "$creds" && state_args+=(--bind "$(src_of "$creds")" "$creds")
 fi
+
+for p in "${extra_rw[@]}"; do extra_binds+=(--bind "$(src_of "$p")" "$p"); done
+for p in "${extra_ro[@]}"; do extra_binds+=(--ro-bind "$(src_of "$p")" "$p"); done
 
 # Resume the last conversation by default. `claude --continue` exits with an
 # error when there is nothing to resume, so only add it once this project has a
@@ -639,9 +573,9 @@ fi
 # non-alphanumeric character replaced by '-'.
 if [[ $default_cmd -eq 1 && $new_session -eq 0 ]]; then
     if [[ $share_claude -eq 1 ]]; then
-        claude_dir="$HOME/.claude"
+        claude_dir="$(src_of "$HOME/.claude")"
     else
-        claude_dir="$state_root/claude"
+        claude_dir="$(src_of "$state_root")/claude"
     fi
     transcripts="$claude_dir/projects/${project//[^a-zA-Z0-9]/-}"
     # Not compgen: the minimal bash a Nix shebang resolves to is built
@@ -691,8 +625,9 @@ env_args+=(--setenv LOGNAME "$box_user_name")
 env_args+=(--setenv PATH "$sandbox_path")
 env_args+=(--setenv PWD "$project")
 
-# The project's .git belongs to the invoking user while git runs as the box
-# user, which git refuses as "dubious ownership" unless the path is allowed.
+# Idmapped, the project reads as the box user's own. This still matters for a
+# project you do not own, which is bound as is: git refuses that as "dubious
+# ownership" unless the path is allowed.
 env_args+=(--setenv GIT_CONFIG_COUNT 1)
 env_args+=(--setenv GIT_CONFIG_KEY_0 safe.directory)
 env_args+=(--setenv GIT_CONFIG_VALUE_0 "$project")
@@ -745,7 +680,7 @@ if [[ $nix_ok -eq 1 ]] && command -v nix >/dev/null 2>&1; then
                  2>/dev/null | tr -d '[:space:]' | grep -o '"trusted":[a-z0-9]*' || true)"
     case "$trusted" in
         '"trusted":true'|'"trusted":1')
-            die "the Nix daemon still trusts this uid ($box_user_name): it is listed in trusted-users (nix.conf), so the sandbox would be able to set build-hook and friends. Use a user that is not." ;;
+            die "the Nix daemon still trusts this uid ($box_user_name): it is listed in trusted-users (nix.conf), so the sandbox would be able to set build-hook and friends. Set a different box_user in claude-box-mount." ;;
     esac
 fi
 
@@ -757,7 +692,7 @@ bwrap_args=(
     "${profile_args[@]}"     # ...so the profile symlinks are recreated here
     --tmpfs /tmp
     --tmpfs /var/tmp
-    "$project_mode" "$project" "$project"
+    "$project_mode" "$(src_of "$project")" "$project"
     "${state_args[@]}"
     "${extra_binds[@]}"
     --unshare-pid
