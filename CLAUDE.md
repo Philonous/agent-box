@@ -20,3 +20,15 @@
 * The nixpkgs non-interactive `bash` (what `patchShebangs` resolves
   `env bash` to) is built without programmable completion, so `compgen` is
   "command not found" in the installed script though it works on the host.
+* Nix daemon trust is per-uid via SO_PEERCRED; `bwrap --uid` cannot change what
+  the daemon sees. `nix store info --json` reports `"trusted"` — use it to check.
+* A read-only bind mount does not stop `connect()` on a unix socket: the EROFS
+  check in `sb_permission` covers reg/dir/lnk only. Hiding a socket means
+  removing the path, not binding it ro.
+* `chmod` on an ACL-bearing path rewrites the ACL mask and can silently revoke a
+  named-user entry — hence state-dir chmods happen at creation only.
+* The sudo switch can't be tested from the agent sandbox: bwrap sets
+  NO_NEW_PRIVS, so setuid sudo refuses ("no new privileges flag is set").
+* `setfacl -m u:<uid>` fails with EINVAL if that uid is not mapped into the
+  current user namespace — so the agent sandbox (which maps only one uid) cannot
+  apply or test ACLs for the box user, though generating them works.

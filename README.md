@@ -8,9 +8,11 @@ Claude Code normally runs with your full ambient authority: it can read every
 file under `$HOME` (other projects, SSH keys, browser profiles, shell history),
 see and signal every process on the machine, and write anywhere you can.
 `claude-box` puts it in a namespace jail where the project directory is the only
-writable path outside its own tmpfs.
+writable path outside its own tmpfs, running as a **separate unprivileged user**
+so that the Nix daemon treats it as an untrusted client and your own files are
+out of reach by file permissions, not just by what is bound.
 
-It is a single ~200-line bash script. There is no image to build and no daemon.
+It is a single bash script. There is no image to build and no daemon.
 
 ## Usage
 
@@ -58,7 +60,8 @@ older `claude-box -- -p '...'` form now tells you to write
 | `--ro-bind PATH` | Additionally bind `PATH` read-only (repeatable) |
 | `--env VAR` | Pass one more environment variable through the scrub (repeatable) |
 | `--new` | Start a fresh conversation instead of passing `--continue` to the default `claude` |
-| `--dry-run` | Print the fully-expanded `bwrap` command and exit |
+| `--setfacl` | Apply the ACLs claude-box would otherwise only print, then start. Never done without this flag |
+| `--dry-run` | Print the command that would run and exit (at the user switch, which is runnable as printed) |
 
 Everything after `--` is the command line to run, verbatim.
 
@@ -69,12 +72,94 @@ Everything after `--` is the command line to run, verbatim.
 | **Filesystem** | `$HOME` is a tmpfs. Only the project directory is bound read-write. `/nix/store` and `/etc` are read-only. `/tmp` and `/var/tmp` are tmpfs. |
 | **Processes** | Private PID namespace — Claude sees ~5 processes instead of your full table, and cannot signal anything on the host. |
 | **IPC / UTS / cgroup** | Separate namespaces; hostname reads as `claude-box`. |
-| **Capabilities** | All dropped, plus `no_new_privs`. |
+| **User** | A separate unprivileged user (default `agents`), so your own files are unreachable by permissions and the Nix daemon sees an untrusted client. |
+| **Capabilities** | All dropped, plus `no_new_privs` — the setuid binaries under `/run/wrappers` cannot elevate inside. |
 | **Environment** | `--clearenv`, then only locale/terminal and `ANTHROPIC_*` variables are re-set, so stray `AWS_*` / `GITHUB_TOKEN` values in your shell do not leak in. |
 | **Lifetime** | `--die-with-parent`: the sandbox dies with the launcher. |
 
 Sibling directories do not leak. Binding `~/projects/foo/bar` materialises only
 the empty path chain `~/projects/foo/`, not `foo`'s other children.
+
+## Running as a separate user
+
+The sandbox does not run as you. On startup `claude-box` re-execs itself through
+`sudo` as an unprivileged user — `agents` by default, override with
+`CLAUDE_BOX_USER` — and only then builds the sandbox.
+
+The reason is the Nix daemon. It decides whether a client is trusted from the
+peer's uid (`SO_PEERCRED`), and a user namespace cannot change what the kernel
+reports there: `bwrap --uid` only relabels the uid inside the namespace. So if
+you are in `trusted-users`, a sandbox running as you can tell the daemon to use
+a different `build-hook`, `post-build-hook` or `substituters`, or to add
+`extra-sandbox-paths` that read host files into a build. That is
+root-equivalent in practice. As a uid that is not trusted, those settings are
+ignored with a warning instead. `claude-box` verifies it rather than assuming
+it, and refuses to launch if the daemon still reports `"trusted":true`:
+
+```sh
+nix store info --json          # inside the box: {"trusted":false,...}
+```
+
+The privilege drop is always printed before it runs, in full:
+
+```
+claude-box: switching to agents — the Nix daemon decides client trust by uid
+claude-box: + sudo -u agents -- /nix/store/...-claude-box/bin/claude-box \
+    --internal-switched --internal-user you --internal-home /home/you \
+    --internal-handoff /tmp/claude-box-handoff.Ab3kR9
+```
+
+The handoff file is how the second phase learns what the first worked out — the
+project path, the state directory, your `$PATH`, the resolved Nix profile links,
+the scrubbed `NIX_CONFIG`. It is kept out of the command line so that the line
+above stays short enough to read, and out of the environment because `sudo`
+resets that unless the sudoers rule says `SETENV`. It is world-readable and
+contains no secrets, by design: `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`
+are *not* carried across, and claude-box says so when they are set.
+
+### Granting access with ACLs
+
+The box user cannot read your project, since `~/projects` is typically `0700`.
+`claude-box` checks what it can actually reach, and when something is missing it
+prints the `setfacl` commands that would grant it and exits — it never changes
+an ACL on its own:
+
+```
+claude-box: running as agents (uid 990), which cannot reach:
+  /home/you/src/foo (directory, read-write)
+
+Run these as the owner of those paths:
+
+  setfacl -m u:agents:x /home/you/src
+  setfacl -R -m u:agents:rwX -m d:u:agents:rwX -m d:u:you:rwX /home/you/src/foo
+
+...or re-run claude-box with --setfacl to apply them before starting.
+```
+
+Three things worth knowing about those commands:
+
+- **Ancestors need `x` of their own.** A recursive ACL on the project is not
+  enough if `~/src` is `0700`: without traversal nothing beneath it can be
+  reached. Every blocking ancestor gets its own entry.
+- **The default entries cut both ways.** Files the box creates are owned by
+  `agents`, so `d:u:you:rwX` is what keeps them editable in place by you
+  afterwards; `d:u:agents:rwX` does the same for files you add later.
+- **They are generous on purpose.** Covering a path that is already reachable
+  costs nothing, and one short list is easier to audit than a minimal one.
+
+The ACLs outlive the run, and they grant access to *anything* running as
+`agents`, not only to a sandboxed process. To revoke:
+
+```sh
+setfacl -R -x u:agents -x d:u:agents ~/src/foo
+setfacl -x u:agents ~/src
+```
+
+Never `setfacl -b`: that would also drop ACLs you set for your own reasons.
+
+One gotcha: `chmod` on a path that has an ACL rewrites its mask, which can
+silently revoke the box user's access. `claude-box` only ever chmods the state
+directory at creation time for that reason.
 
 ## Per-project Claude state
 
@@ -95,7 +180,17 @@ Two details make this painless:
   the sandbox rotate the OAuth refresh token and silently invalidate your host
   login; sharing the one file keeps them in sync while exposing nothing else.
 
-Use `--share-claude` to opt out and use your real config directly.
+Under the user switch, that shared credentials file is one of the paths the box
+user has to be able to read, so it appears in the `setfacl` list with a warning:
+the ACL hands your Claude credentials to anything running as `agents` until you
+revoke it. If you would rather not, delete `~/.claude/.credentials.json` from
+the ACL and sign in once inside the box instead — the login persists in the
+project's own state directory. Note that Claude Code rewriting that file can
+replace the inode and take the ACL with it, in which case claude-box simply
+prints the command again.
+
+Use `--share-claude` to opt out and use your real config directly. It needs an
+ACL on your real `~/.claude`, which is a much broader grant.
 
 ## Running it with Nix
 
@@ -136,8 +231,13 @@ just a matter of reaching its socket.
 
 - `/nix/var` is bound **read-only** — `NIX_PATH` channels live under
   `/nix/var/nix/profiles`, and the client only ever reads them.
-- `/nix/var/nix/daemon-socket` is re-bound read-write on top, so `connect()`
-  works. Every actual write to the store stays the daemon's to make.
+- `/nix/var/nix/daemon-socket` is re-bound read-write on top. Every actual write
+  to the store stays the daemon's to make. Note that the read-write bind is not
+  what grants access: `connect()` on a unix socket works through a read-only
+  bind mount too, because the kernel's `EROFS` check covers regular files,
+  directories and symlinks but not sockets — the same reason mounting
+  `docker.sock:ro` protects nothing. What makes the connection untrusted is the
+  uid it comes from.
 - `NIX_PATH` and `NIX_REMOTE` are passed through, so `<nixpkgs>` resolves.
 - `~/.config/nix/nix.conf` is **not** bound, because it routinely carries
   `access-tokens`. Its settings still matter — `experimental-features` decides
@@ -188,19 +288,41 @@ These are real, and worth reading before relying on this.
 - **The Nix daemon is reachable.** `nix build` inside the sandbox is a request
   to a root process outside it. The daemon has its own build sandbox and its own
   network access, so this is a channel the confinement does not cover. It is
-  bounded by what the daemon already exposes to any unprivileged user on the
-  host, and `--no-nix` closes it.
+  bounded by what the daemon exposes to an *untrusted* client — client-specified
+  `substituters`, `build-hook`, `extra-sandbox-paths` and friends are ignored —
+  but realising derivations and fetching from the configured substituters are
+  still possible, so CPU and disk abuse are not prevented. Evaluation-time
+  fetching (`builtins.fetchurl`, import-from-derivation) happens client-side,
+  inside the sandbox, with the sandbox's network. `--no-nix` closes all of it.
 - **No git identity.** `~/.gitconfig` is not bound, so `git commit` fails on a
   missing `user.name`/`user.email` unless the repo sets them locally. Opt in
   with `--ro-bind ~/.gitconfig`.
 - **No SSH agent**, so `git push` over SSH will not work.
-- **Same UID.** This is a namespace jail, not a privilege boundary. It contains
-  a misbehaving agent, not a kernel exploit. There is no seccomp filter.
+- **Not a privilege boundary.** It contains a misbehaving agent, not a kernel
+  exploit. There is no seccomp filter. The separate uid adds real depth — your
+  files are protected by permissions, not only by which paths are bound — but
+  the ACLs you grant are visible to *every* process running as that user, and a
+  `0755` `$HOME` still lets it read world-readable files that happen to be bound
+  in.
 
 ## Requirements
 
 A kernel allowing unprivileged user namespaces (check
-`/proc/sys/user/max_user_namespaces` is non-zero). Everything else —
-`bubblewrap`, `python3` or `jq` for first-run config seeding, and the toolchain
-the sandbox sees — comes from the flake. Running the script directly rather than
-through Nix needs `bubblewrap` on `PATH`.
+`/proc/sys/user/max_user_namespaces` is non-zero), plus three things for the
+user switch:
+
+- **The box user.** An unprivileged account that is *not* in `trusted-users`
+  (`nix.conf`) — `agents` by default, or set `CLAUDE_BOX_USER`. It needs no
+  home directory, shell or group of its own.
+- **A sudo rule** letting you run claude-box as that user, e.g.
+  `you ALL=(agents) NOPASSWD: /nix/store/...-claude-box/bin/claude-box` — or
+  nothing at all, and type your password at each start. `sudo` has to be the
+  host's setuid one, so it is deliberately not in the flake's toolchain.
+- **A filesystem with ACL support** for the project and state paths (ext4,
+  btrfs, xfs, zfs with `acltype=posixacl`). `setfacl` reporting
+  `Operation not supported` means the paths cannot be shared this way.
+
+Everything else — `bubblewrap`, `acl`, `python3` or `jq` for first-run config
+seeding, and the toolchain the sandbox sees — comes from the flake. Running the
+script directly rather than through Nix needs `bubblewrap` and `setfacl` on
+`PATH`.

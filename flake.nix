@@ -30,6 +30,12 @@
         bashInteractive coreutils findutils gnugrep gnused gawk
         diffutils patch less which procps
 
+        # setfacl/getfacl: how the box user is granted the paths it needs
+        # (claude-box only ever prints those commands, or runs them under
+        # --setfacl). sudo is deliberately absent: the privilege drop needs the
+        # host's setuid one, which a store copy could never be.
+        acl
+
         # version control and search
         git gh ripgrep fd jq tree
 
@@ -57,9 +63,15 @@
             patchShebangs $out/bin/claude-box
             # bwrap is pinned ahead of the host's: the sandbox depends on its
             # exact flag behaviour. Everything else is a fallback.
+            # CLAUDE_BOX_SELF is the wrapper's own path. The privilege drop
+            # re-execs claude-box under sudo, and it has to be this wrapper
+            # rather than the wrapped script: sudo resets the environment, so
+            # the PATH set up here is what puts bubblewrap and the toolchain
+            # back for the second phase.
             wrapProgram $out/bin/claude-box \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
               --suffix PATH : ${pkgs.lib.makeBinPath (toolchain pkgs)} \
+              --set CLAUDE_BOX_SELF $out/bin/claude-box \
               --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
             runHook postInstall
           '';
