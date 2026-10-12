@@ -513,6 +513,9 @@ fi
 if [[ $default_cmd -eq 1 ]]; then
     cmd+=(--append-system-prompt "You are running inside a restricted \
 sandbox. Do not make assumptions about the project based on the environment. \
+Do not read user data or run search queries outside the project folder. \
+$HOME is a tmpfs, you can write there (within reason), but all data will be lost.\
+If you need to keep data between sessions, store it in the project folder under .agents. \
 Do not try to work around the sandbox, instead, ask the user")
 fi
 
